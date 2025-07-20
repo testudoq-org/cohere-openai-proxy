@@ -1,30 +1,36 @@
 /**
- * Cohere Proxy Server
+ * Cohere Proxy Server - Enhanced Token Handling and Dynamic Model Support
  * 
- * A production-ready Express.js server that acts as a proxy between OpenAI-compatible 
- * chat completion requests and Cohere's API. This server translates OpenAI's chat 
- * completion format to Cohere's generate API format and returns OpenAI-compatible responses.
+ * A production-ready Express.js server acting as a proxy between OpenAI-compatible 
+ * chat completion requests and Cohere's API. Includes improved token management, 
+ * dynamic model fetching, and enhanced error handling.
  * 
- * Features:
- * - OpenAI Chat Completions API compatibility
- * - Rate limiting and security middleware
- * - Comprehensive error handling and validation
- * - Health monitoring endpoint
- * - Request logging and performance tracking
- * - Support for multiple Cohere models
- * - Token usage estimation
+ * Key Features:
+ * - Accurate token estimation using tiktoken library
+ * - Dynamic fetching of supported Cohere models
+ * - Intelligent request truncation and optimization
+ * - Configurable token limits and rate limiting via environment variables
+ * - Graceful shutdown handling
+ * - Comprehensive error logging and OpenAI-compatible responses
+ * - Support for both Chat and Generate API endpoints
  * 
- * Usage:
- * POST /v1/chat/completions - Main chat completion endpoint
- * GET /health - Health check endpoint
+ * Endpoints:
+ * - POST /v1/chat/completions - Main chat completion endpoint
+ * - GET /health - Health check endpoint
  * 
  * Environment Variables:
  * - COHERE_API_KEY: Your Cohere API key (required)
  * - PORT: Server port (default: 3000)
  * - ALLOWED_ORIGINS: Comma-separated list of allowed CORS origins (default: *)
+ * - MAX_TOTAL_TOKENS: Maximum total tokens (input + output) (default: 4000)
+ * - MIN_COMPLETION_TOKENS: Minimum tokens reserved for completion (default: 50)
+ * - MAX_COMPLETION_TOKENS: Maximum completion tokens (default: 2048)
+ * - TOKEN_SAFETY_BUFFER: Safety buffer for token calculations (default: 100)
+ * - RATE_LIMIT_WINDOW_MS: Rate limit window in milliseconds (default: 900000)
+ * - RATE_LIMIT_MAX_REQUESTS: Maximum requests per window (default: 100)
  * 
  * @author Assistant
- * @version 2.0.1
+ * @version 2.3.0
  */
 
 require('dotenv').config();
@@ -34,6 +40,15 @@ const { CohereClient } = require('cohere-ai');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const morgan = require('morgan');
+const { encoding_for_model } = require('tiktoken');
+
+// Validate required environment variables
+const requiredEnvVars = ['COHERE_API_KEY'];
+for (const varName of requiredEnvVars) {
+  if (!process.env[varName]) {
+    throw new Error(`Missing required environment variable: ${varName}`);
+  }
+}
 
 class CohereProxyServer {
   constructor() {
@@ -42,23 +57,42 @@ class CohereProxyServer {
     this.cohere = new CohereClient({
       token: process.env.COHERE_API_KEY,
     });
-    
+    this.tokenizer = encoding_for_model('gpt-3.5-turbo'); // Use tiktoken for accurate estimation
+    this.supportedModels = new Set(); // Dynamically fetched models
+
+    // Configurable limits
+    this.MAX_TOTAL_TOKENS = parseInt(process.env.MAX_TOTAL_TOKENS) || 4000;
+    this.MIN_COMPLETION_TOKENS = parseInt(process.env.MIN_COMPLETION_TOKENS) || 50;
+    this.MAX_COMPLETION_TOKENS = parseInt(process.env.MAX_COMPLETION_TOKENS) || 2048;
+    this.TOKEN_SAFETY_BUFFER = parseInt(process.env.TOKEN_SAFETY_BUFFER) || 100;
+
+    // Rate limiting configuration
+    this.RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000;
+    this.RATE_LIMIT_MAX_REQUESTS = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100;
+
     this.setupMiddleware();
     this.setupRoutes();
     this.setupErrorHandling();
+    this.fetchSupportedModels(); // Dynamically fetch supported models
+  }
+
+  async fetchSupportedModels() {
+    try {
+      const models = await this.cohere.listModels();
+      this.supportedModels = new Set(models.map(model => model.name));
+      console.log(`[INFO] Supported Cohere models: ${Array.from(this.supportedModels).join(', ')}`);
+    } catch (error) {
+      console.error('[ERROR] Failed to fetch supported models:', error.message);
+    }
   }
 
   setupMiddleware() {
-    // Security middleware
     this.app.use(helmet());
-    
-    // Logging middleware
     this.app.use(morgan('combined'));
-    
-    // Rate limiting
+
     const limiter = rateLimit({
-      windowMs: 15 * 60 * 1000, // 15 minutes
-      max: 100, // limit each IP to 100 requests per windowMs
+      windowMs: this.RATE_LIMIT_WINDOW_MS,
+      max: this.RATE_LIMIT_MAX_REQUESTS,
       message: {
         error: {
           message: 'Too many requests from this IP, please try again later.',
@@ -67,33 +101,35 @@ class CohereProxyServer {
       }
     });
     this.app.use(limiter);
-    
-    // CORS configuration
+
     this.app.use(cors({
       origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
       methods: ['GET', 'POST'],
       allowedHeaders: ['Content-Type', 'Authorization']
     }));
-    
-    // Body parsing
+
     this.app.use(express.json({ limit: '10mb' }));
     this.app.use(express.urlencoded({ extended: true }));
   }
 
   setupRoutes() {
-    // Health check endpoint
     this.app.get('/health', (req, res) => {
       res.json({
         status: 'healthy',
         timestamp: new Date().toISOString(),
-        uptime: process.uptime()
+        uptime: process.uptime(),
+        limits: {
+          max_total_tokens: this.MAX_TOTAL_TOKENS,
+          max_completion_tokens: this.MAX_COMPLETION_TOKENS,
+          min_completion_tokens: this.MIN_COMPLETION_TOKENS,
+          token_safety_buffer: this.TOKEN_SAFETY_BUFFER
+        },
+        version: '2.3.0'
       });
     });
 
-    // Main chat completions endpoint
     this.app.post('/v1/chat/completions', this.handleChatCompletion.bind(this));
-    
-    // Fallback for undefined routes - Fixed to avoid path-to-regexp issues
+
     this.app.use((req, res) => {
       res.status(404).json({
         error: {
@@ -105,22 +141,13 @@ class CohereProxyServer {
   }
 
   async handleChatCompletion(req, res) {
-    try {
-      // Validate API key
-      if (!process.env.COHERE_API_KEY) {
-        return res.status(500).json({
-          error: {
-            message: 'Cohere API key not configured',
-            type: 'configuration_error'
-          }
-        });
-      }
+    const startTime = Date.now();
 
-      // Extract and validate request parameters
+    try {
       const {
         messages,
         temperature = 0.7,
-        max_tokens = 300,
+        max_tokens: requestedMaxTokens,
         model = 'command-r',
         stream = false
       } = req.body;
@@ -134,213 +161,268 @@ class CohereProxyServer {
         });
       }
 
-      // Validate temperature and max_tokens
-      if (temperature < 0 || temperature > 2) {
-        return res.status(400).json({
-          error: {
-            message: 'Temperature must be between 0 and 2',
-            type: 'invalid_request_error'
-          }
-        });
-      }
-
-      if (max_tokens < 1 || max_tokens > 4096) {
-        return res.status(400).json({
-          error: {
-            message: 'max_tokens must be between 1 and 4096',
-            type: 'invalid_request_error'
-          }
-        });
-      }
-
       const validatedModel = this.validateModel(model);
-      const startTime = Date.now();
-      
-      // Use appropriate API based on model type
+
+      const processedRequest = this.processAndOptimizeRequest(messages, requestedMaxTokens);
+      if (processedRequest.error) {
+        return res.status(400).json({
+          error: processedRequest.error
+        });
+      }
+
+      const {
+        optimizedMessages,
+        promptTokens,
+        completionTokens,
+        totalTokens,
+        truncated
+      } = processedRequest;
+
+      console.log(`[TOKEN_ANALYSIS] Prompt: ${promptTokens}, Completion: ${completionTokens}, Total: ${totalTokens}${truncated ? ' (truncated)' : ''}`);
+
       let response;
       let generatedText;
-      
+
       if (this.isChatModel(validatedModel)) {
-        // Use Chat API for newer models
-        const cohereMessages = this.formatMessagesForCohereChat(messages);
-        
+        const { message, chatHistory } = this.formatMessagesForCohereChat(optimizedMessages);
         response = await this.cohere.chat({
           model: validatedModel,
-          message: cohereMessages.message,
-          chatHistory: cohereMessages.chatHistory,
+          message,
+          chatHistory,
           temperature,
-          maxTokens: max_tokens
+          maxTokens: completionTokens
         });
-        
-        generatedText = response.text.trim();
+        generatedText = response.text || '';
       } else {
-        // Use Generate API for older models
-        const prompt = this.formatMessagesForCohere(messages);
-        
+        const prompt = this.formatMessagesForCohere(optimizedMessages);
         response = await this.cohere.generate({
           model: validatedModel,
           prompt,
           temperature,
-          maxTokens: max_tokens,
-          returnLikelihoods: 'NONE'
+          maxTokens: completionTokens,
+          truncate: 'END'
         });
-        
-        generatedText = response.generations[0].text.trim();
+        generatedText = response.generations?.[0]?.text || '';
+      }
+
+      if (!generatedText) {
+        generatedText = 'Unable to generate a response. Please try again.';
       }
 
       const processingTime = Date.now() - startTime;
+      const finalCompletionTokens = this.estimateTokens(generatedText);
+      const finalTotalTokens = promptTokens + finalCompletionTokens;
 
-      // Estimate token usage (rough approximation)
-      const promptTokens = this.estimateTokens(JSON.stringify(messages));
-      const completionTokens = this.estimateTokens(generatedText);
-
-      // Return OpenAI-compatible response
       const completionResponse = {
         id: `chatcmpl-${this.generateId()}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model: `cohere/${model}`,
-        choices: [
-          {
-            index: 0,
-            message: {
-              role: 'assistant',
-              content: generatedText,
-            },
-            finish_reason: 'stop',
-          },
-        ],
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: generatedText },
+          finish_reason: 'stop',
+        }],
         usage: {
           prompt_tokens: promptTokens,
-          completion_tokens: completionTokens,
-          total_tokens: promptTokens + completionTokens,
+          completion_tokens: finalCompletionTokens,
+          total_tokens: finalTotalTokens,
         },
-        system_fingerprint: `cohere_${model}_${Date.now()}`,
-        processing_time_ms: processingTime
+        system_fingerprint: `cohere_${validatedModel}_${Date.now()}`,
+        processing_time_ms: processingTime,
+        ...(truncated && { warning: 'Request was automatically truncated' })
       };
 
       res.json(completionResponse);
 
     } catch (error) {
-      console.error('Error in chat completion:', {
+      const processingTime = Date.now() - startTime;
+      console.error(`[ERROR] Chat completion failed after ${processingTime}ms:`, {
         message: error.message,
-        stack: error.stack,
         timestamp: new Date().toISOString()
       });
 
-      // Handle different types of errors
       let statusCode = 500;
       let errorType = 'internal_server_error';
+      let errorMessage = 'An unexpected error occurred';
 
       if (error.message.includes('API key')) {
         statusCode = 401;
         errorType = 'authentication_error';
-      } else if (error.message.includes('rate limit') || error.message.includes('quota')) {
+        errorMessage = 'Invalid API key';
+      } else if (error.message.includes('rate limit')) {
         statusCode = 429;
         errorType = 'rate_limit_exceeded';
+        errorMessage = 'Rate limit exceeded';
       } else if (error.message.includes('model')) {
         statusCode = 400;
         errorType = 'invalid_request_error';
+        errorMessage = error.message;
       }
 
       res.status(statusCode).json({
         error: {
-          message: error.message || 'An unexpected error occurred',
+          message: errorMessage,
           type: errorType,
+          processing_time_ms: processingTime,
           timestamp: new Date().toISOString()
         }
       });
     }
   }
 
-  formatMessagesForCohere(messages) {
-    // Convert OpenAI chat format to Cohere prompt format (for Generate API)
-    let prompt = '';
-    
-    for (const message of messages) {
-      if (message.role === 'system') {
-        prompt += `System: ${message.content}\n\n`;
-      } else if (message.role === 'user') {
-        prompt += `Human: ${message.content}\n\n`;
-      } else if (message.role === 'assistant') {
-        prompt += `Assistant: ${message.content}\n\n`;
-      }
-    }
-    
-    prompt += 'Assistant:';
-    return prompt;
-  }
+  processAndOptimizeRequest(messages, requestedMaxTokens) {
+    const promptTokens = this.calculateMessagesTokens(messages);
+    const completionTokens = this.calculateOptimalCompletionTokens(promptTokens, requestedMaxTokens);
+    const totalTokens = promptTokens + completionTokens;
 
-  formatMessagesForCohereChat(messages) {
-    // Convert OpenAI chat format to Cohere Chat API format
-    const chatHistory = [];
-    let currentMessage = '';
-    let systemMessage = '';
-    
-    for (let i = 0; i < messages.length; i++) {
-      const message = messages[i];
-      
-      if (message.role === 'system') {
-        systemMessage = message.content;
-      } else if (message.role === 'user') {
-        if (i === messages.length - 1) {
-          // This is the current user message
-          currentMessage = systemMessage ? `${systemMessage}\n\n${message.content}` : message.content;
-        } else {
-          // This is part of chat history
-          chatHistory.push({
-            role: 'USER',
-            message: message.content
-          });
-        }
-      } else if (message.role === 'assistant') {
-        chatHistory.push({
-          role: 'CHATBOT',
-          message: message.content
-        });
-      }
+    if (totalTokens <= this.MAX_TOTAL_TOKENS) {
+      return {
+        optimizedMessages: messages,
+        promptTokens,
+        completionTokens,
+        totalTokens,
+        truncated: false
+      };
     }
-    
+
+    const maxAllowedPrompt = this.MAX_TOTAL_TOKENS - this.MIN_COMPLETION_TOKENS - this.TOKEN_SAFETY_BUFFER;
+    if (promptTokens <= maxAllowedPrompt) {
+      const completionTokens = this.MAX_TOTAL_TOKENS - promptTokens - this.TOKEN_SAFETY_BUFFER;
+      return {
+        optimizedMessages: messages,
+        promptTokens,
+        completionTokens,
+        totalTokens: promptTokens + completionTokens,
+        truncated: false
+      };
+    }
+
+    const optimizedMessages = this.intelligentTruncateMessages(messages, maxAllowedPrompt);
+    const newPromptTokens = this.calculateMessagesTokens(optimizedMessages);
+    const newCompletionTokens = this.calculateOptimalCompletionTokens(newPromptTokens, requestedMaxTokens);
+
     return {
-      message: currentMessage,
-      chatHistory: chatHistory
+      optimizedMessages,
+      promptTokens: newPromptTokens,
+      completionTokens: newCompletionTokens,
+      totalTokens: newPromptTokens + newCompletionTokens,
+      truncated: true
     };
   }
 
-  isChatModel(model) {
-    // Models that require Chat API instead of Generate API
-    const chatModels = [
-      'command-r',
-      'command-r-plus'
-    ];
-    
-    return chatModels.includes(model);
+  estimateTokens(text) {
+    return this.tokenizer.encode(text).length;
+  }
+
+  calculateMessagesTokens(messages) {
+    return messages.reduce((total, message) => {
+      return total + this.estimateTokens(message.content || '') + 4; // Overhead for role, content, and structure
+    }, 2); // Base conversation overhead
+  }
+
+  intelligentTruncateMessages(messages, targetTokens) {
+    if (this.calculateMessagesTokens(messages) <= targetTokens) {
+      return messages;
+    }
+
+    const truncatedMessages = [...messages];
+    let systemMessage = null;
+    let lastUserMessage = null;
+    const conversationHistory = [];
+
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i];
+      if (message.role === 'system') {
+        systemMessage = message;
+      } else if (message.role === 'user' && i === messages.length - 1) {
+        lastUserMessage = message;
+      } else {
+        conversationHistory.push(message);
+      }
+    }
+
+    const essentialTokens = (systemMessage ? this.estimateTokens(systemMessage.content) + 4 : 0) +
+      (lastUserMessage ? this.estimateTokens(lastUserMessage.content) + 4 : 0) + 10;
+
+    const availableForHistory = targetTokens - essentialTokens;
+    if (availableForHistory < 0) {
+      if (lastUserMessage) {
+        lastUserMessage.content = this.truncateTextIntelligently(lastUserMessage.content, targetTokens - (systemMessage ? this.estimateTokens(systemMessage.content) + 4 : 0) - 50);
+      }
+      return [systemMessage, lastUserMessage].filter(Boolean);
+    }
+
+    const optimizedHistory = this.selectOptimalHistory(conversationHistory, availableForHistory);
+    const result = [];
+    if (systemMessage) result.push(systemMessage);
+    result.push(...optimizedHistory);
+    if (lastUserMessage) result.push(lastUserMessage);
+
+    return result;
+  }
+
+  selectOptimalHistory(conversationHistory, maxTokens) {
+    let usedTokens = 0;
+    const selectedHistory = [];
+
+    for (let i = conversationHistory.length - 1; i >= 0; i--) {
+      const message = conversationHistory[i];
+      const messageTokens = this.estimateTokens(message.content) + 4;
+
+      if (usedTokens + messageTokens <= maxTokens) {
+        selectedHistory.unshift(message);
+        usedTokens += messageTokens;
+      } else {
+        break;
+      }
+    }
+
+    return selectedHistory;
+  }
+
+  truncateTextIntelligently(text, maxTokens) {
+    if (!text || typeof text !== 'string') return '';
+    const maxChars = maxTokens * 3.5; // Conservative estimate
+    if (text.length <= maxChars) return text;
+
+    const sentences = text.split(/[.!?]+/);
+    for (let i = sentences.length - 1; i >= 0; i--) {
+      const candidate = sentences.slice(i).join('.').trim() + '.';
+      if (candidate.length <= maxChars) {
+        return candidate;
+      }
+    }
+
+    return text.substring(0, maxChars) + '...';
   }
 
   validateModel(model) {
-    const allowedModels = [
-      // Chat API models
-      'command-r',
-      'command-r-plus',
-      // Generate API models (older)
-      'command',
-      'command-nightly',
-      'command-light',
-      'command-light-nightly'
-    ];
-    
-    const cleanModel = model.replace('cohere/', '');
-    
-    if (!allowedModels.includes(cleanModel)) {
-      throw new Error(`Model ${model} is not supported. Supported models: ${allowedModels.join(', ')}`);
+    const modelMapping = {
+      'free': 'command-light',
+      'default': 'command-r',
+      'gpt-3.5-turbo': 'command-r',
+      'gpt-4': 'command-r-plus',
+      'text-davinci-003': 'command',
+      'claude': 'command-r',
+      'cohere': 'command-r'
+    };
+
+    let cleanModel = model.replace('cohere/', '').toLowerCase().trim();
+    if (modelMapping[cleanModel]) {
+      cleanModel = modelMapping[cleanModel];
     }
-    
+
+    if (!this.supportedModels.has(cleanModel)) {
+      throw new Error(`Model ${model} is not supported. Supported models: ${Array.from(this.supportedModels).join(', ')}`);
+    }
+
     return cleanModel;
   }
 
-  estimateTokens(text) {
-    // Rough estimation: 1 token ≈ 4 characters for English text
-    return Math.ceil(text.length / 4);
+  isChatModel(model) {
+    const chatModels = ['command-r', 'command-r-plus'];
+    return chatModels.includes(model);
   }
 
   generateId() {
@@ -348,45 +430,52 @@ class CohereProxyServer {
   }
 
   setupErrorHandling() {
-    // Global error handler
     this.app.use((error, req, res, next) => {
-      console.error('Unhandled error:', {
+      console.error('[GLOBAL_ERROR] Unhandled error:', {
         message: error.message,
-        stack: error.stack,
-        url: req.url,
-        method: req.method,
         timestamp: new Date().toISOString()
       });
-
       res.status(500).json({
         error: {
           message: 'Internal server error',
-          type: 'internal_server_error'
+          type: 'internal_server_error',
+          timestamp: new Date().toISOString()
         }
       });
     });
 
-    // Handle uncaught exceptions
     process.on('uncaughtException', (error) => {
-      console.error('Uncaught Exception:', error);
-      process.exit(1);
+      console.error('[UNCAUGHT_EXCEPTION]:', error);
+      setTimeout(() => process.exit(1), 1000);
     });
 
     process.on('unhandledRejection', (reason, promise) => {
-      console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-      process.exit(1);
+      console.error('[UNHANDLED_REJECTION] at:', promise, 'reason:', reason);
+      setTimeout(() => process.exit(1), 1000);
     });
-  }
 
-  start() {
-    return new Promise((resolve) => {
-      const server = this.app.listen(this.port, () => {
-        console.log(`✅ Cohere proxy server running at http://localhost:${this.port}`);
-        console.log(`📊 Health check available at http://localhost:${this.port}/health`);
-        console.log(`🔐 Rate limiting: 100 requests per 15 minutes per IP`);
-        resolve(server);
+    // Graceful shutdown
+    let server;
+    process.on('SIGTERM', () => {
+      console.log('[INFO] SIGTERM signal received: closing HTTP server');
+      server?.close(() => {
+        console.log('[INFO] HTTP server closed');
+        process.exit(0);
       });
     });
+
+    this.start = () => {
+      return new Promise((resolve) => {
+        server = this.app.listen(this.port, () => {
+          console.log(`✅ Cohere proxy server (v2.3.0) running at http://localhost:${this.port}`);
+          console.log(`📊 Health check available at http://localhost:${this.port}/health`);
+          console.log(`🔐 Rate limiting: ${this.RATE_LIMIT_MAX_REQUESTS} requests per ${this.RATE_LIMIT_WINDOW_MS / 1000} seconds per IP`);
+          console.log(`🎯 Token limits: ${this.MAX_TOTAL_TOKENS} total, ${this.MAX_COMPLETION_TOKENS} max completion`);
+          console.log(`⚡ Improved token handling and intelligent truncation active`);
+          resolve(server);
+        });
+      });
+    };
   }
 }
 

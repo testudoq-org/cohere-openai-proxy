@@ -37,6 +37,9 @@ COHERE_API_KEY=your_cohere_api_key_here
 PORT=3000
 ALLOWED_ORIGINS=http://localhost:3000,https://yourdomain.com
 ```
+**Note:**  
+If you are using an OpenAI-compatible client, you may set `OPENAI_API_KEY` or similar config for compatibility.  
+The proxy server itself does not use or validate the OpenAI API key; authentication is handled via `COHERE_API_KEY` in your `.env` file.
 
 4. Start the server:
 ```bash
