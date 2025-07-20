@@ -24,7 +24,7 @@
  * - ALLOWED_ORIGINS: Comma-separated list of allowed CORS origins (default: *)
  * 
  * @author Assistant
- * @version 2.0.0
+ * @version 2.0.1
  */
 
 require('dotenv').config();
@@ -93,8 +93,8 @@ class CohereProxyServer {
     // Main chat completions endpoint
     this.app.post('/v1/chat/completions', this.handleChatCompletion.bind(this));
     
-    // Fallback for undefined routes
-    this.app.all('*', (req, res) => {
+    // Fallback for undefined routes - Fixed to avoid path-to-regexp issues
+    this.app.use((req, res) => {
       res.status(404).json({
         error: {
           message: `Route ${req.method} ${req.path} not found`,
@@ -153,24 +153,45 @@ class CohereProxyServer {
         });
       }
 
-      // Convert messages to Cohere format
-      const prompt = this.formatMessagesForCohere(messages);
-
-      // Make request to Cohere
+      const validatedModel = this.validateModel(model);
       const startTime = Date.now();
-      const response = await this.cohere.generate({
-        model: this.validateModel(model),
-        prompt,
-        temperature,
-        maxTokens: max_tokens,
-        returnLikelihoods: 'NONE'
-      });
+      
+      // Use appropriate API based on model type
+      let response;
+      let generatedText;
+      
+      if (this.isChatModel(validatedModel)) {
+        // Use Chat API for newer models
+        const cohereMessages = this.formatMessagesForCohereChat(messages);
+        
+        response = await this.cohere.chat({
+          model: validatedModel,
+          message: cohereMessages.message,
+          chatHistory: cohereMessages.chatHistory,
+          temperature,
+          maxTokens: max_tokens
+        });
+        
+        generatedText = response.text.trim();
+      } else {
+        // Use Generate API for older models
+        const prompt = this.formatMessagesForCohere(messages);
+        
+        response = await this.cohere.generate({
+          model: validatedModel,
+          prompt,
+          temperature,
+          maxTokens: max_tokens,
+          returnLikelihoods: 'NONE'
+        });
+        
+        generatedText = response.generations[0].text.trim();
+      }
 
       const processingTime = Date.now() - startTime;
-      const generatedText = response.generations[0].text.trim();
 
       // Estimate token usage (rough approximation)
-      const promptTokens = this.estimateTokens(prompt);
+      const promptTokens = this.estimateTokens(JSON.stringify(messages));
       const completionTokens = this.estimateTokens(generatedText);
 
       // Return OpenAI-compatible response
@@ -186,7 +207,7 @@ class CohereProxyServer {
               role: 'assistant',
               content: generatedText,
             },
-            finish_reason: response.generations[0].finish_reason || 'stop',
+            finish_reason: 'stop',
           },
         ],
         usage: {
@@ -233,7 +254,7 @@ class CohereProxyServer {
   }
 
   formatMessagesForCohere(messages) {
-    // Convert OpenAI chat format to Cohere prompt format
+    // Convert OpenAI chat format to Cohere prompt format (for Generate API)
     let prompt = '';
     
     for (const message of messages) {
@@ -250,10 +271,58 @@ class CohereProxyServer {
     return prompt;
   }
 
+  formatMessagesForCohereChat(messages) {
+    // Convert OpenAI chat format to Cohere Chat API format
+    const chatHistory = [];
+    let currentMessage = '';
+    let systemMessage = '';
+    
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i];
+      
+      if (message.role === 'system') {
+        systemMessage = message.content;
+      } else if (message.role === 'user') {
+        if (i === messages.length - 1) {
+          // This is the current user message
+          currentMessage = systemMessage ? `${systemMessage}\n\n${message.content}` : message.content;
+        } else {
+          // This is part of chat history
+          chatHistory.push({
+            role: 'USER',
+            message: message.content
+          });
+        }
+      } else if (message.role === 'assistant') {
+        chatHistory.push({
+          role: 'CHATBOT',
+          message: message.content
+        });
+      }
+    }
+    
+    return {
+      message: currentMessage,
+      chatHistory: chatHistory
+    };
+  }
+
+  isChatModel(model) {
+    // Models that require Chat API instead of Generate API
+    const chatModels = [
+      'command-r',
+      'command-r-plus'
+    ];
+    
+    return chatModels.includes(model);
+  }
+
   validateModel(model) {
     const allowedModels = [
+      // Chat API models
       'command-r',
       'command-r-plus',
+      // Generate API models (older)
       'command',
       'command-nightly',
       'command-light',
@@ -328,71 +397,3 @@ if (require.main === module) {
 }
 
 module.exports = CohereProxyServer;
-
- * KEY IMPROVEMENTS FROM ORIGINAL VERSION:
- * 
- * 🏗️ ARCHITECTURE & ORGANIZATION:
- * - Converted from procedural to class-based structure for better maintainability
- * - Separated concerns with dedicated methods (setupMiddleware, setupRoutes, etc.)
- * - Added proper module exports for testing and integration
- * - Organized code into logical sections with clear responsibilities
- * 
- * 🔐 SECURITY ENHANCEMENTS:
- * - Added Helmet.js for security headers (XSS protection, content type sniffing, etc.)
- * - Implemented express-rate-limit (100 requests per 15 minutes per IP)
- * - Enhanced CORS configuration with environment-based allowed origins
- * - Added request size limits (10MB body parser limit)
- * - API key validation before making requests
- * - Input sanitization and validation
- * 
- * ⚠️ ERROR HANDLING & VALIDATION:
- * - Comprehensive input validation (messages array, temperature range, token limits)
- * - Structured error responses with proper HTTP status codes and error types
- * - Global error handlers for uncaught exceptions and unhandled rejections
- * - Detailed error logging with timestamps and context
- * - Graceful handling of different error scenarios (auth, rate limits, invalid models)
- * - 404 handler for undefined routes
- * 
- * 📊 MONITORING & LOGGING:
- * - Added Morgan for HTTP request logging
- * - Health check endpoint (/health) for monitoring uptime and status
- * - Processing time tracking for performance monitoring
- * - Detailed console logging with structured error information
- * - Request/response timing and metrics
- * 
- * 🤖 ENHANCED COHERE INTEGRATION:
- * - Updated to use the latest CohereClient instead of legacy cohere.init()
- * - Better message formatting that properly handles system/user/assistant roles
- * - Model validation with comprehensive list of supported Cohere models
- * - Improved prompt construction for better conversation context
- * - Enhanced parameter mapping (maxTokens vs max_tokens)
- * 
- * 📈 FEATURE ADDITIONS:
- * - Token usage estimation with prompt and completion token counts
- * - Support for additional request parameters (model selection, streaming flag)
- * - System fingerprint generation for response tracking
- * - Unique ID generation for each completion
- * - Better OpenAI API compatibility with all required response fields
- * - Processing time measurement and reporting
- * 
- * 🚀 PRODUCTION READINESS:
- * - Environment variable validation and configuration
- * - Graceful startup and shutdown handling
- * - Better resource management and memory usage
- * - Scalable architecture that can be easily extended
- * - Configuration-driven behavior (ports, origins, rate limits)
- * - Proper HTTP status code usage throughout
- * 
- * 🔧 DEVELOPER EXPERIENCE:
- * - Clear code organization and commenting
- * - Reusable and testable class structure
- * - Easy to extend and modify functionality
- * - Better debugging capabilities with detailed logging
- * - Separation of concerns for easier maintenance
- * 
- * 📦 DEPENDENCIES ADDED:
- * - express-rate-limit: For API rate limiting
- * - helmet: For security middleware
- * - morgan: For HTTP request logging
- * - Updated cohere-ai: For latest API compatibility
- */
