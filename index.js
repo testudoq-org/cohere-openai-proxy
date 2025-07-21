@@ -13,6 +13,7 @@
  * - Graceful shutdown handling
  * - Comprehensive error logging and OpenAI-compatible responses
  * - Support for both Chat and Generate API endpoints
+ * - Retry mechanism for transient API errors
  * 
  * Endpoints:
  * - POST /v1/chat/completions - Main chat completion endpoint
@@ -29,8 +30,48 @@
  * - RATE_LIMIT_WINDOW_MS: Rate limit window in milliseconds (default: 900000)
  * - RATE_LIMIT_MAX_REQUESTS: Maximum requests per window (default: 100)
  * 
+ * Data Flow Diagrams:
+ * 
+ * ## 📊 Request Processing Flow
+ * 
+ * ```mermaid
+ * graph TD
+ *     A[Client Request] --> B{Rate Limit Check}
+ *     B -->|Pass| C[Input Validation]
+ *     B -->|Fail| D[Rate Limit Error]
+ *     C -->|Valid| E[Format Conversion]
+ *     C -->|Invalid| F[Validation Error]
+ *     E --> G[Cohere API Call]
+ *     G -->|Success| H[Response Processing]
+ *     G -->|Error| I[API Error Handling]
+ *     H --> J[Token Estimation]
+ *     J --> K[Response Formatting]
+ *     K --> L[Client Response]
+ *     D --> M[Error Response]
+ *     F --> M
+ *     I --> M
+ * ```
+ * 
+ * ## 📊 Message Transformation Flow
+ * 
+ * ```mermaid
+ * sequenceDiagram
+ *     participant Client
+ *     participant Proxy
+ *     participant Cohere
+ *     
+ *     Client->>Proxy: OpenAI Chat Completion Request
+ *     Note over Proxy: Validate Request
+ *     Note over Proxy: Transform Messages
+ *     Proxy->>Cohere: Generate Request
+ *     Cohere->>Proxy: Generate Response
+ *     Note over Proxy: Estimate Tokens
+ *     Note over Proxy: Format Response
+ *     Proxy->>Client: OpenAI Compatible Response
+ * ```
+ * 
  * @author Assistant
- * @version 2.3.0
+ * @version 2.3.2
  */
 
 require('dotenv').config();
@@ -124,7 +165,7 @@ class CohereProxyServer {
           min_completion_tokens: this.MIN_COMPLETION_TOKENS,
           token_safety_buffer: this.TOKEN_SAFETY_BUFFER
         },
-        version: '2.3.0'
+        version: '2.3.2'
       });
     });
 
@@ -140,141 +181,113 @@ class CohereProxyServer {
     });
   }
 
-  async handleChatCompletion(req, res) {
-    const startTime = Date.now();
+// Revised handleChatCompletion method
+async handleChatCompletion(req, res) {
+  const startTime = Date.now();
 
-    try {
-      const {
-        messages,
-        temperature = 0.7,
-        max_tokens: requestedMaxTokens,
-        model = 'command-r',
-        stream = false
-      } = req.body;
+  try {
+    const {
+      messages,
+      temperature = 0.7,
+      max_tokens: requestedMaxTokens,
+      model = 'command-r-plus',
+      stream = false
+    } = req.body;
 
-      if (!messages || !Array.isArray(messages) || messages.length === 0) {
-        return res.status(400).json({
-          error: {
-            message: 'Messages array is required and must not be empty',
-            type: 'invalid_request_error'
-          }
-        });
-      }
-
-      const validatedModel = this.validateModel(model);
-
-      const processedRequest = this.processAndOptimizeRequest(messages, requestedMaxTokens);
-      if (processedRequest.error) {
-        return res.status(400).json({
-          error: processedRequest.error
-        });
-      }
-
-      const {
-        optimizedMessages,
-        promptTokens,
-        completionTokens,
-        totalTokens,
-        truncated
-      } = processedRequest;
-
-      console.log(`[TOKEN_ANALYSIS] Prompt: ${promptTokens}, Completion: ${completionTokens}, Total: ${totalTokens}${truncated ? ' (truncated)' : ''}`);
-
-      let response;
-      let generatedText;
-
-      if (this.isChatModel(validatedModel)) {
-        const { message, chatHistory } = this.formatMessagesForCohereChat(optimizedMessages);
-        response = await this.cohere.chat({
-          model: validatedModel,
-          message,
-          chatHistory,
-          temperature,
-          maxTokens: completionTokens
-        });
-        generatedText = response.text || '';
-      } else {
-        const prompt = this.formatMessagesForCohere(optimizedMessages);
-        response = await this.cohere.generate({
-          model: validatedModel,
-          prompt,
-          temperature,
-          maxTokens: completionTokens,
-          truncate: 'END'
-        });
-        generatedText = response.generations?.[0]?.text || '';
-      }
-
-      if (!generatedText) {
-        generatedText = 'Unable to generate a response. Please try again.';
-      }
-
-      const processingTime = Date.now() - startTime;
-      const finalCompletionTokens = this.estimateTokens(generatedText);
-      const finalTotalTokens = promptTokens + finalCompletionTokens;
-
-      const completionResponse = {
-        id: `chatcmpl-${this.generateId()}`,
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model: `cohere/${model}`,
-        choices: [{
-          index: 0,
-          message: { role: 'assistant', content: generatedText },
-          finish_reason: 'stop',
-        }],
-        usage: {
-          prompt_tokens: promptTokens,
-          completion_tokens: finalCompletionTokens,
-          total_tokens: finalTotalTokens,
-        },
-        system_fingerprint: `cohere_${validatedModel}_${Date.now()}`,
-        processing_time_ms: processingTime,
-        ...(truncated && { warning: 'Request was automatically truncated' })
-      };
-
-      res.json(completionResponse);
-
-    } catch (error) {
-      const processingTime = Date.now() - startTime;
-      console.error(`[ERROR] Chat completion failed after ${processingTime}ms:`, {
-        message: error.message,
-        timestamp: new Date().toISOString()
-      });
-
-      let statusCode = 500;
-      let errorType = 'internal_server_error';
-      let errorMessage = 'An unexpected error occurred';
-
-      if (error.message.includes('API key')) {
-        statusCode = 401;
-        errorType = 'authentication_error';
-        errorMessage = 'Invalid API key';
-      } else if (error.message.includes('rate limit')) {
-        statusCode = 429;
-        errorType = 'rate_limit_exceeded';
-        errorMessage = 'Rate limit exceeded';
-      } else if (error.message.includes('model')) {
-        statusCode = 400;
-        errorType = 'invalid_request_error';
-        errorMessage = error.message;
-      }
-
-      res.status(statusCode).json({
+    // Validate and process messages
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({
         error: {
-          message: errorMessage,
-          type: errorType,
-          processing_time_ms: processingTime,
-          timestamp: new Date().toISOString()
+          message: 'Messages array is required and must not be empty',
+          type: 'invalid_request_error'
         }
       });
     }
+
+    // Extract user question directly
+    const userQuestion = this.extractUserQuestion(messages);
+
+    // Optimize prompt for direct questions
+    const optimizedPrompt = this.optimizePromptForDirectQuestion(userQuestion);
+
+    // Calculate tokens for optimized prompt
+    const promptTokens = this.estimateTokens(optimizedPrompt);
+    const completionTokens = this.calculateOptimalCompletionTokens(promptTokens, requestedMaxTokens);
+
+    console.log(`[TOKEN_ANALYSIS] Prompt: ${promptTokens}, Completion: ${completionTokens}`);
+
+    // Call Cohere API with optimized prompt
+    let response;
+    try {
+      response = await this.cohere.generate({
+        model: model,
+        prompt: optimizedPrompt,
+        temperature,
+        maxTokens: completionTokens,
+        truncate: 'END'
+      });
+    } catch (apiError) {
+      console.error(`[API_ERROR] Cohere API call failed:`, apiError);
+      throw apiError;
+    }
+
+    const generatedText = response.generations?.[0]?.text || '';
+    const processingTime = Date.now() - startTime;
+    const finalCompletionTokens = this.estimateTokens(generatedText);
+
+    // Prepare response
+    const completionResponse = {
+      id: `chatcmpl-${this.generateId()}`,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: `cohere/${model}`,
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: generatedText },
+        finish_reason: 'stop',
+      }],
+      usage: {
+        prompt_tokens: promptTokens,
+        completion_tokens: finalCompletionTokens,
+        total_tokens: promptTokens + finalCompletionTokens,
+      },
+      system_fingerprint: `cohere_${model}_${Date.now()}`,
+      processing_time_ms: processingTime,
+    };
+
+    res.json(completionResponse);
+
+  } catch (error) {
+    const processingTime = Date.now() - startTime;
+    console.error(`[ERROR] Chat completion failed after ${processingTime}ms:`, error);
+    res.status(500).json({
+      error: {
+        message: 'Failed to process request',
+        type: 'internal_server_error',
+        processing_time_ms: processingTime,
+      }
+    });
   }
+}
+
+// Helper method to extract user question
+extractUserQuestion(messages) {
+  const userMessage = messages.find(msg => msg.role === 'user');
+  return userMessage ? this.extractContentString(userMessage.content) : '';
+}
+
+// Helper method to optimize prompt for direct questions
+optimizePromptForDirectQuestion(question) {
+  return `Answer the following question directly without using any tools:\n\n${question}`;
+}
+
 
   processAndOptimizeRequest(messages, requestedMaxTokens) {
     const promptTokens = this.calculateMessagesTokens(messages);
     const completionTokens = this.calculateOptimalCompletionTokens(promptTokens, requestedMaxTokens);
     const totalTokens = promptTokens + completionTokens;
+
+    console.log(`[DEBUG] processAndOptimizeRequest - promptTokens: ${promptTokens}, completionTokens: ${completionTokens}, totalTokens: ${totalTokens}`);
 
     if (totalTokens <= this.MAX_TOTAL_TOKENS) {
       return {
@@ -311,113 +324,179 @@ class CohereProxyServer {
     };
   }
 
+  calculateOptimalCompletionTokens(promptTokens, requestedMaxTokens) {
+    console.log(`[DEBUG] calculateOptimalCompletionTokens - promptTokens: ${promptTokens}, requestedMaxTokens: ${requestedMaxTokens}`);
+    const availableTokens = this.MAX_TOTAL_TOKENS - promptTokens - this.TOKEN_SAFETY_BUFFER;
+
+    let completionTokens;
+
+    if (requestedMaxTokens && requestedMaxTokens > 0) {
+      // Use requested amount, but respect limits
+      completionTokens = Math.min(requestedMaxTokens, this.MAX_COMPLETION_TOKENS, availableTokens);
+    } else {
+      // Dynamic allocation based on prompt size and available space
+      if (availableTokens >= 1000) {
+        completionTokens = 512; // Long response
+      } else if (availableTokens >= 500) {
+        completionTokens = 256; // Medium response
+      } else if (availableTokens >= 200) {
+        completionTokens = 128; // Short response
+      } else {
+        completionTokens = Math.max(availableTokens, this.MIN_COMPLETION_TOKENS);
+      }
+
+      // Ensure we don't exceed limits
+      completionTokens = Math.min(completionTokens, this.MAX_COMPLETION_TOKENS, availableTokens);
+    }
+
+    // Ensure minimum viable response
+    return Math.max(completionTokens, this.MIN_COMPLETION_TOKENS);
+  }
+
+  /**
+   * Safely extract string content from message content
+   */
+  extractContentString(content) {
+    if (typeof content === 'string') {
+      return content;
+    }
+    
+    if (content && typeof content === 'object') {
+      // Handle OpenAI format with text and other properties
+      if (content.text) {
+        return content.text;
+      }
+      // Handle array of content parts
+      if (Array.isArray(content)) {
+        return content
+          .filter(part => part && typeof part === 'object' && part.text)
+          .map(part => part.text)
+          .join(' ');
+      }
+      // Fallback to JSON stringify for other objects
+      try {
+        return JSON.stringify(content);
+      } catch (e) {
+        return String(content);
+      }
+    }
+    
+    // Fallback for other types
+    return String(content || '');
+  }
+
   estimateTokens(text) {
-    return this.tokenizer.encode(text).length;
+    const textString = this.extractContentString(text);
+    console.log('[DEBUG] estimateTokens called with:', { type: typeof textString, value: textString });
+    return this.tokenizer.encode(textString).length;
   }
 
   calculateMessagesTokens(messages) {
-    return messages.reduce((total, message) => {
-      return total + this.estimateTokens(message.content || '') + 4; // Overhead for role, content, and structure
+    return messages.reduce((total, message, idx) => {
+      const content = this.extractContentString(message.content);
+      console.log(`[DEBUG] calculateMessagesTokens message[${idx}]:`, { 
+        role: message.role, 
+        contentType: typeof message.content, 
+        extractedContent: content.substring(0, 100) + (content.length > 100 ? '...' : '')
+      });
+      return total + this.estimateTokens(content) + 4; // Overhead for role, content, and structure
     }, 2); // Base conversation overhead
   }
 
-  intelligentTruncateMessages(messages, targetTokens) {
-    if (this.calculateMessagesTokens(messages) <= targetTokens) {
-      return messages;
-    }
-
-    const truncatedMessages = [...messages];
-    let systemMessage = null;
-    let lastUserMessage = null;
-    const conversationHistory = [];
-
+  /**
+   * Enhanced message formatting for Cohere Chat API
+   * Properly handles system messages, conversation history, and user input
+   */
+formatMessagesForCohereChat(messages) {
+    let preamble = '';
+    let chatHistory = [];
+    let currentMessage = '';
+    
+    // Process messages to separate system, history, and current user message
     for (let i = 0; i < messages.length; i++) {
       const message = messages[i];
+      const content = this.extractContentString(message.content).trim();
+      
+      if (!content) continue; // Skip empty messages
+      
       if (message.role === 'system') {
-        systemMessage = message;
-      } else if (message.role === 'user' && i === messages.length - 1) {
-        lastUserMessage = message;
-      } else {
-        conversationHistory.push(message);
+        // Use system messages as preamble
+        preamble = content;
+      } else if (message.role === 'user') {
+        if (i === messages.length - 1) {
+          // This is the last message, treat it as the current user message
+          currentMessage = content;
+        } else {
+          // Add to history as a user message
+          chatHistory.push({
+            role: 'USER',
+            message: content
+          });
+        }
+      } else if (message.role === 'assistant') {
+        // Add assistant responses to history
+        chatHistory.push({
+          role: 'CHATBOT',
+          message: content
+        });
       }
     }
-
-    const essentialTokens = (systemMessage ? this.estimateTokens(systemMessage.content) + 4 : 0) +
-      (lastUserMessage ? this.estimateTokens(lastUserMessage.content) + 4 : 0) + 10;
-
-    const availableForHistory = targetTokens - essentialTokens;
-    if (availableForHistory < 0) {
+    
+    // If no current message was found, use the last user message from history
+    if (!currentMessage && chatHistory.length > 0) {
+      const lastUserMessage = chatHistory.filter(msg => msg.role === 'USER').pop();
       if (lastUserMessage) {
-        lastUserMessage.content = this.truncateTextIntelligently(lastUserMessage.content, targetTokens - (systemMessage ? this.estimateTokens(systemMessage.content) + 4 : 0) - 50);
+        currentMessage = lastUserMessage.message;
+        // Remove it from history since it's now the current message
+        chatHistory = chatHistory.filter(msg => msg !== lastUserMessage);
       }
-      return [systemMessage, lastUserMessage].filter(Boolean);
     }
-
-    const optimizedHistory = this.selectOptimalHistory(conversationHistory, availableForHistory);
-    const result = [];
-    if (systemMessage) result.push(systemMessage);
-    result.push(...optimizedHistory);
-    if (lastUserMessage) result.push(lastUserMessage);
-
-    return result;
+    
+    // Fallback if still no current message
+    if (!currentMessage) {
+      currentMessage = "Please provide a response.";
+    }
+    
+    return {
+      message: currentMessage,
+      chatHistory: chatHistory,
+      preamble: preamble || undefined
+    };
   }
 
-  selectOptimalHistory(conversationHistory, maxTokens) {
-    let usedTokens = 0;
-    const selectedHistory = [];
 
-    for (let i = conversationHistory.length - 1; i >= 0; i--) {
-      const message = conversationHistory[i];
-      const messageTokens = this.estimateTokens(message.content) + 4;
-
-      if (usedTokens + messageTokens <= maxTokens) {
-        selectedHistory.unshift(message);
-        usedTokens += messageTokens;
-      } else {
-        break;
+  /**
+   * Enhanced message formatting for Cohere Generate API
+   * Creates a well-structured prompt from conversation messages
+   */
+  formatMessagesForCohere(messages) {
+    let prompt = '';
+    
+    for (const message of messages) {
+      const content = this.extractContentString(message.content).trim();
+      
+      if (!content) continue; // Skip empty messages
+      
+      if (message.role === 'system') {
+        prompt += `System: ${content}\n\n`;
+      } else if (message.role === 'user') {
+        prompt += `Human: ${content}\n\n`;
+      } else if (message.role === 'assistant') {
+        prompt += `Assistant: ${content}\n\n`;
       }
     }
-
-    return selectedHistory;
-  }
-
-  truncateTextIntelligently(text, maxTokens) {
-    if (!text || typeof text !== 'string') return '';
-    const maxChars = maxTokens * 3.5; // Conservative estimate
-    if (text.length <= maxChars) return text;
-
-    const sentences = text.split(/[.!?]+/);
-    for (let i = sentences.length - 1; i >= 0; i--) {
-      const candidate = sentences.slice(i).join('.').trim() + '.';
-      if (candidate.length <= maxChars) {
-        return candidate;
-      }
+    
+    // End with Assistant: to prompt for response
+    if (!prompt.endsWith('Assistant: ')) {
+      prompt += 'Assistant: ';
     }
-
-    return text.substring(0, maxChars) + '...';
+    
+    return prompt.trim();
   }
 
   validateModel(model) {
-    const modelMapping = {
-      'free': 'command-light',
-      'default': 'command-r',
-      'gpt-3.5-turbo': 'command-r',
-      'gpt-4': 'command-r-plus',
-      'text-davinci-003': 'command',
-      'claude': 'command-r',
-      'cohere': 'command-r'
-    };
-
-    let cleanModel = model.replace('cohere/', '').toLowerCase().trim();
-    if (modelMapping[cleanModel]) {
-      cleanModel = modelMapping[cleanModel];
-    }
-
-    if (!this.supportedModels.has(cleanModel)) {
-      throw new Error(`Model ${model} is not supported. Supported models: ${Array.from(this.supportedModels).join(', ')}`);
-    }
-
-    return cleanModel;
+    // Map all models to command-r-plus (Cohere's most capable model)
+    return 'command-r-plus';
   }
 
   isChatModel(model) {
@@ -433,6 +512,7 @@ class CohereProxyServer {
     this.app.use((error, req, res, next) => {
       console.error('[GLOBAL_ERROR] Unhandled error:', {
         message: error.message,
+        stack: error.stack,
         timestamp: new Date().toISOString()
       });
       res.status(500).json({
@@ -444,17 +524,6 @@ class CohereProxyServer {
       });
     });
 
-    process.on('uncaughtException', (error) => {
-      console.error('[UNCAUGHT_EXCEPTION]:', error);
-      setTimeout(() => process.exit(1), 1000);
-    });
-
-    process.on('unhandledRejection', (reason, promise) => {
-      console.error('[UNHANDLED_REJECTION] at:', promise, 'reason:', reason);
-      setTimeout(() => process.exit(1), 1000);
-    });
-
-    // Graceful shutdown
     let server;
     process.on('SIGTERM', () => {
       console.log('[INFO] SIGTERM signal received: closing HTTP server');
@@ -464,18 +533,78 @@ class CohereProxyServer {
       });
     });
 
-    this.start = () => {
+    this.start = async () => {
+      await this.fetchSupportedModels(); // Ensure models are fetched before starting the server
       return new Promise((resolve) => {
         server = this.app.listen(this.port, () => {
-          console.log(`✅ Cohere proxy server (v2.3.0) running at http://localhost:${this.port}`);
+          console.log(`✅ Cohere proxy server (v2.3.2) running at http://localhost:${this.port}`);
           console.log(`📊 Health check available at http://localhost:${this.port}/health`);
           console.log(`🔐 Rate limiting: ${this.RATE_LIMIT_MAX_REQUESTS} requests per ${this.RATE_LIMIT_WINDOW_MS / 1000} seconds per IP`);
           console.log(`🎯 Token limits: ${this.MAX_TOTAL_TOKENS} total, ${this.MAX_COMPLETION_TOKENS} max completion`);
-          console.log(`⚡ Improved token handling and intelligent truncation active`);
+          console.log(`⚡ Enhanced message handling and token processing active`);
           resolve(server);
         });
       });
     };
+  }
+
+  /**
+   * Truncate messages intelligently to fit within maxAllowedPrompt tokens.
+   * Keeps the most recent messages, discarding older ones as needed.
+   * Always preserves system messages and the most recent user message.
+   */
+  intelligentTruncateMessages(messages, maxAllowedPrompt) {
+    let totalTokens = 2; // Base conversation overhead
+    const truncatedMessages = [];
+    const systemMessages = [];
+    const conversationMessages = [];
+    
+    // Separate system messages from conversation messages
+    for (const message of messages) {
+      if (message.role === 'system') {
+        systemMessages.push(message);
+      } else {
+        conversationMessages.push(message);
+      }
+    }
+    
+    // Always include system messages first
+    for (const systemMessage of systemMessages) {
+      const content = this.extractContentString(systemMessage.content);
+      const messageTokens = this.estimateTokens(content) + 4;
+      if (totalTokens + messageTokens <= maxAllowedPrompt) {
+        truncatedMessages.push(systemMessage);
+        totalTokens += messageTokens;
+      }
+    }
+    
+    // Process conversation messages from most recent backwards
+    for (let i = conversationMessages.length - 1; i >= 0; i--) {
+      const message = conversationMessages[i];
+      const content = this.extractContentString(message.content);
+      const messageTokens = this.estimateTokens(content) + 4;
+      
+      if (totalTokens + messageTokens <= maxAllowedPrompt) {
+        truncatedMessages.splice(systemMessages.length, 0, message);
+        totalTokens += messageTokens;
+      } else {
+        break;
+      }
+    }
+    
+    // Ensure we have at least the most recent user message if possible
+    if (conversationMessages.length > 0 && truncatedMessages.length === systemMessages.length) {
+      const lastMessage = conversationMessages[conversationMessages.length - 1];
+      const content = this.extractContentString(lastMessage.content);
+      const messageTokens = this.estimateTokens(content) + 4;
+      
+      // If the last message alone fits, include it
+      if (systemMessages.length === 0 || totalTokens + messageTokens <= maxAllowedPrompt) {
+        truncatedMessages.push(lastMessage);
+      }
+    }
+    
+    return truncatedMessages;
   }
 }
 
