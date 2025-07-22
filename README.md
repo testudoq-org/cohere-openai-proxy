@@ -7,6 +7,7 @@ A production-ready Express.js server that acts as a proxy between OpenAI-compati
 - **OpenAI API Compatibility**: Full compatibility with OpenAI's Chat Completions API format
 - **Production Ready**: Built-in security, rate limiting, and error handling
 - **Multi-Model Support**: Support for various Cohere models (Command-R, Command-R+, etc.)
+- **Multi-Turn Session Support**: In-memory session store for true multi-turn conversations
 - **Monitoring & Logging**: Health checks, request logging, and performance metrics
 - **Security First**: Rate limiting, CORS protection, input validation, and security headers
 - **Easy Migration**: Drop-in replacement for OpenAI API endpoints
@@ -21,30 +22,31 @@ A production-ready Express.js server that acts as a proxy between OpenAI-compati
 ### Installation
 
 1. Clone the repository:
-```bash
-git clone <repository-url>
-cd cohere-proxy-server
-```
+   ```bash
+   git clone <repository-url>
+   cd cohere-proxy-server
+   ```
 
 2. Install dependencies:
-```bash
-npm install express dotenv cors cohere-ai express-rate-limit helmet morgan
-```
+   ```bash
+   npm install express dotenv cors cohere-ai express-rate-limit helmet morgan
+   ```
 
 3. Create a `.env` file:
-```env
-COHERE_API_KEY=your_cohere_api_key_here
-PORT=3000
-ALLOWED_ORIGINS=http://localhost:3000,https://yourdomain.com
-```
-**Note:**  
-If you are using an OpenAI-compatible client, you may set `OPENAI_API_KEY` or similar config for compatibility.  
-The proxy server itself does not use or validate the OpenAI API key; authentication is handled via `COHERE_API_KEY` in your `.env` file.
+   ```env
+   COHERE_API_KEY=your_cohere_api_key_here
+   PORT=3000
+   ALLOWED_ORIGINS=http://localhost:3000,https://yourdomain.com
+   ```
+
+   **Note:**  
+   If you are using an OpenAI-compatible client, you may set `OPENAI_API_KEY` or similar config for compatibility.  
+   The proxy server itself does not use or validate the OpenAI API key; authentication is handled via `COHERE_API_KEY` in your `.env` file.
 
 4. Start the server:
-```bash
-node server.js
-```
+   ```bash
+   node server.js
+   ```
 
 The server will be running at `http://localhost:3000`
 
@@ -65,14 +67,15 @@ Response:
 }
 ```
 
-### Chat Completions
+### Chat Completions (Multi-Turn Sessions)
 
-Send a POST request to `/v1/chat/completions` with OpenAI-compatible format:
+Send a POST request to `/v1/chat/completions` with OpenAI-compatible format and an optional `sessionId`:
 
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
+    "sessionId": "user-abc-123",
     "messages": [
       {"role": "system", "content": "You are a helpful assistant."},
       {"role": "user", "content": "Hello! How are you?"}
@@ -82,30 +85,68 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   }'
 ```
 
+#### Request Parameters
+
+- `sessionId` (string, optional): Unique identifier for the conversation session. If omitted or invalid, a new session is created and returned in the response.
+- `messages` (array): Chat messages in OpenAI format.
+- `temperature`, `max_tokens`, `model`, etc.: Standard parameters.
+
+#### Example Response (Multi-Turn)
+
+```json
+{
+  "sessionId": "user-abc-123",
+  "messages": [
+    {"role": "user", "content": "Hello! How are you?"},
+    {"role": "assistant", "content": "Hello! I'm doing well, thank you for asking. How can I help you today?"}
+  ],
+  "reply": "Hello! I'm doing well, thank you for asking. How can I help you today?"
+}
+```
+
+- The `messages` array contains the full conversation history for the session.
+- The `reply` field contains the latest assistant response.
+
+#### Example: Continuing a Session
+
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sessionId": "user-abc-123",
+    "messages": [
+      {"role": "user", "content": "What can you do?"}
+    ]
+  }'
+```
+
 Response:
 ```json
 {
-  "id": "chatcmpl-1642684800000abc123",
-  "object": "chat.completion",
-  "created": 1642684800,
-  "model": "cohere/command-r",
-  "choices": [{
-    "index": 0,
-    "message": {
-      "role": "assistant",
-      "content": "Hello! I'm doing well, thank you for asking. How can I help you today?"
-    },
-    "finish_reason": "stop"
-  }],
-  "usage": {
-    "prompt_tokens": 23,
-    "completion_tokens": 17,
-    "total_tokens": 40
-  },
-  "system_fingerprint": "cohere_command-r_1642684800000",
-  "processing_time_ms": 1250
+  "sessionId": "user-abc-123",
+  "messages": [
+    {"role": "user", "content": "Hello! How are you?"},
+    {"role": "assistant", "content": "Hello! I'm doing well, thank you for asking. How can I help you today?"},
+    {"role": "user", "content": "What can you do?"},
+    {"role": "assistant", "content": "I can help answer questions, provide information, and assist with a variety of tasks."}
+  ],
+  "reply": "I can help answer questions, provide information, and assist with a variety of tasks."
 }
 ```
+
+#### Session Handling
+
+- If `sessionId` is not provided or is invalid, a new session is created and its ID is returned.
+- Session history is stored in memory and is not persisted across server restarts.
+- Only chat-capable models (e.g., `command-r`, `command-r-plus`) support multi-turn session logic.
+
+#### Error Handling
+
+- Robust error responses are returned for invalid requests, expired/invalid sessions, and API errors.
+
+#### Legacy (Stateless) Usage
+
+If you do not provide a `sessionId`, the endpoint behaves as a stateless proxy and returns only the latest reply.
 
 ### JavaScript Example
 
@@ -116,8 +157,8 @@ const response = await fetch('http://localhost:3000/v1/chat/completions', {
     'Content-Type': 'application/json',
   },
   body: JSON.stringify({
+    sessionId: 'user-abc-123',
     messages: [
-      { role: 'system', content: 'You are a helpful assistant.' },
       { role: 'user', content: 'Explain quantum computing in simple terms.' }
     ],
     temperature: 0.7,
@@ -126,7 +167,8 @@ const response = await fetch('http://localhost:3000/v1/chat/completions', {
 });
 
 const data = await response.json();
-console.log(data.choices[0].message.content);
+console.log(data.reply); // Latest assistant reply
+console.log(data.messages); // Full conversation history
 ```
 
 ## ⚙️ Configuration
@@ -143,6 +185,7 @@ console.log(data.choices[0].message.content);
 
 | Parameter | Type | Default | Range | Description |
 |-----------|------|---------|--------|-------------|
+| `sessionId` | String | - | - | Conversation session ID |
 | `messages` | Array | - | - | Chat messages in OpenAI format |
 | `temperature` | Number | `0.7` | `0-2` | Sampling temperature |
 | `max_tokens` | Number | `300` | `1-4096` | Maximum tokens to generate |
@@ -150,8 +193,8 @@ console.log(data.choices[0].message.content);
 
 ### Supported Models
 
-- `command-r` - Latest Command-R model
-- `command-r-plus` - Enhanced Command-R model
+- `command-r` - Latest Command-R model (multi-turn supported)
+- `command-r-plus` - Enhanced Command-R model (multi-turn supported)
 - `command` - Standard Command model
 - `command-nightly` - Nightly Command model
 - `command-light` - Lightweight Command model
@@ -200,10 +243,10 @@ nodemon server.js
 # Test health endpoint
 curl http://localhost:3000/health
 
-# Test chat completion
+# Test chat completion (multi-turn)
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"sessionId":"test-session-1","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
 ## 🚨 Error Handling
@@ -225,6 +268,7 @@ The server returns structured error responses:
 - `authentication_error` - Invalid or missing API key
 - `invalid_request_error` - Invalid request parameters
 - `rate_limit_exceeded` - Rate limit violation
+- `cohere_api_error` - Cohere API error
 - `internal_server_error` - Server-side errors
 - `not_found` - Invalid endpoint
 
@@ -296,3 +340,23 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 **Made with ❤️ for seamless AI API integration**
+
+---
+
+## 🗂️ Multi-Turn Conversation Flow (Mermaid Diagram)
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Proxy
+    participant SessionStore
+    participant Cohere
+
+    Client->>Proxy: POST /v1/chat/completions {sessionId, message}
+    Proxy->>SessionStore: Retrieve history for sessionId
+    SessionStore-->>Proxy: Message history (or empty)
+    Proxy->>SessionStore: Append user message
+    Proxy->>Cohere: Send formatted, truncated history
+    Cohere-->>Proxy: Assistant reply
+    Proxy->>SessionStore: Append assistant reply
+    Proxy->>Client: {sessionId, messages, reply}

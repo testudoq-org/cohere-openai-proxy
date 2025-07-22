@@ -82,6 +82,7 @@ const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const { encoding_for_model } = require('tiktoken');
+const MemoryCache = require('./memoryCache'); // <-- Add cache import
 
 // Validate required environment variables
 const requiredEnvVars = ['COHERE_API_KEY'];
@@ -110,6 +111,9 @@ class CohereProxyServer {
     // Rate limiting configuration
     this.RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000;
     this.RATE_LIMIT_MAX_REQUESTS = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100;
+
+    // In-memory prompt cache (TTL: 5 min, max 500 entries)
+    this.promptCache = new MemoryCache(5 * 60 * 1000, 500);
 
     this.setupMiddleware();
     this.setupRoutes();
@@ -181,105 +185,141 @@ class CohereProxyServer {
     });
   }
 
-// Revised handleChatCompletion method
-async handleChatCompletion(req, res) {
-  const startTime = Date.now();
+  // Generate a cache key based on model, prompt, parameters, and session context
+  generateCacheKey({ model, optimizedPrompt, temperature, maxTokens, sessionId, messages }) {
+    // For session-based, include sessionId and message history
+    const base = JSON.stringify({
+      model,
+      prompt: optimizedPrompt,
+      temperature,
+      maxTokens,
+      sessionId: sessionId || null,
+      messages: messages ? messages.map(m => ({ role: m.role, content: this.extractContentString(m.content) })) : undefined
+    });
+    // Simple hash (FNV-1a or similar) for brevity, but here just use base64 for demo
+    return Buffer.from(base).toString('base64');
+  }
 
-  try {
-    const {
-      messages,
-      temperature = 0.7,
-      max_tokens: requestedMaxTokens,
-      model = 'command-r-plus',
-      stream = false
-    } = req.body;
+  // Revised handleChatCompletion method with caching
+  async handleChatCompletion(req, res) {
+    const startTime = Date.now();
 
-    // Validate and process messages
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({
+    try {
+      const {
+        messages,
+        temperature = 0.7,
+        max_tokens: requestedMaxTokens,
+        model = 'command-r-plus',
+        stream = false,
+        sessionId // support sessionId for cache key
+      } = req.body;
+
+      // Validate and process messages
+      if (!messages || !Array.isArray(messages) || messages.length === 0) {
+        return res.status(400).json({
+          error: {
+            message: 'Messages array is required and must not be empty',
+            type: 'invalid_request_error'
+          }
+        });
+      }
+
+      // Extract user question directly
+      const userQuestion = this.extractUserQuestion(messages);
+
+      // Optimize prompt for direct questions
+      const optimizedPrompt = this.optimizePromptForDirectQuestion(userQuestion);
+
+      // Calculate tokens for optimized prompt
+      const promptTokens = this.estimateTokens(optimizedPrompt);
+      const completionTokens = this.calculateOptimalCompletionTokens(promptTokens, requestedMaxTokens);
+
+      // Generate cache key
+      const cacheKey = this.generateCacheKey({
+        model,
+        optimizedPrompt,
+        temperature,
+        maxTokens: completionTokens,
+        sessionId,
+        messages
+      });
+
+      // Check cache
+      const cached = this.promptCache.get(cacheKey);
+      if (cached) {
+        console.log('[CACHE] Hit for key:', cacheKey);
+        return res.json({ ...cached, cache: true });
+      }
+
+      console.log(`[TOKEN_ANALYSIS] Prompt: ${promptTokens}, Completion: ${completionTokens}`);
+
+      // Call Cohere API with optimized prompt
+      let response;
+      try {
+        response = await this.cohere.generate({
+          model: model,
+          prompt: optimizedPrompt,
+          temperature,
+          maxTokens: completionTokens,
+          truncate: 'END'
+        });
+      } catch (apiError) {
+        console.error(`[API_ERROR] Cohere API call failed:`, apiError);
+        throw apiError;
+      }
+
+      const generatedText = response.generations?.[0]?.text || '';
+      const processingTime = Date.now() - startTime;
+      const finalCompletionTokens = this.estimateTokens(generatedText);
+
+      // Prepare response
+      const completionResponse = {
+        id: `chatcmpl-${this.generateId()}`,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: `cohere/${model}`,
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: generatedText },
+          finish_reason: 'stop',
+        }],
+        usage: {
+          prompt_tokens: promptTokens,
+          completion_tokens: finalCompletionTokens,
+          total_tokens: promptTokens + finalCompletionTokens,
+        },
+        system_fingerprint: `cohere_${model}_${Date.now()}`,
+        processing_time_ms: processingTime,
+      };
+
+      // Only cache successful responses
+      this.promptCache.set(cacheKey, completionResponse);
+
+      res.json(completionResponse);
+
+    } catch (error) {
+      const processingTime = Date.now() - startTime;
+      console.error(`[ERROR] Chat completion failed after ${processingTime}ms:`, error);
+      res.status(500).json({
         error: {
-          message: 'Messages array is required and must not be empty',
-          type: 'invalid_request_error'
+          message: 'Failed to process request',
+          type: 'internal_server_error',
+          processing_time_ms: processingTime,
         }
       });
     }
-
-    // Extract user question directly
-    const userQuestion = this.extractUserQuestion(messages);
-
-    // Optimize prompt for direct questions
-    const optimizedPrompt = this.optimizePromptForDirectQuestion(userQuestion);
-
-    // Calculate tokens for optimized prompt
-    const promptTokens = this.estimateTokens(optimizedPrompt);
-    const completionTokens = this.calculateOptimalCompletionTokens(promptTokens, requestedMaxTokens);
-
-    console.log(`[TOKEN_ANALYSIS] Prompt: ${promptTokens}, Completion: ${completionTokens}`);
-
-    // Call Cohere API with optimized prompt
-    let response;
-    try {
-      response = await this.cohere.generate({
-        model: model,
-        prompt: optimizedPrompt,
-        temperature,
-        maxTokens: completionTokens,
-        truncate: 'END'
-      });
-    } catch (apiError) {
-      console.error(`[API_ERROR] Cohere API call failed:`, apiError);
-      throw apiError;
-    }
-
-    const generatedText = response.generations?.[0]?.text || '';
-    const processingTime = Date.now() - startTime;
-    const finalCompletionTokens = this.estimateTokens(generatedText);
-
-    // Prepare response
-    const completionResponse = {
-      id: `chatcmpl-${this.generateId()}`,
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model: `cohere/${model}`,
-      choices: [{
-        index: 0,
-        message: { role: 'assistant', content: generatedText },
-        finish_reason: 'stop',
-      }],
-      usage: {
-        prompt_tokens: promptTokens,
-        completion_tokens: finalCompletionTokens,
-        total_tokens: promptTokens + finalCompletionTokens,
-      },
-      system_fingerprint: `cohere_${model}_${Date.now()}`,
-      processing_time_ms: processingTime,
-    };
-
-    res.json(completionResponse);
-
-  } catch (error) {
-    const processingTime = Date.now() - startTime;
-    console.error(`[ERROR] Chat completion failed after ${processingTime}ms:`, error);
-    res.status(500).json({
-      error: {
-        message: 'Failed to process request',
-        type: 'internal_server_error',
-        processing_time_ms: processingTime,
-      }
-    });
   }
-}
 
-// Helper method to extract user question
-extractUserQuestion(messages) {
-  const userMessage = messages.find(msg => msg.role === 'user');
-  return userMessage ? this.extractContentString(userMessage.content) : '';
-}
+  // Helper method to extract user question
+  extractUserQuestion(messages) {
+    const userMessage = messages.find(msg => msg.role === 'user');
+    return userMessage ? this.extractContentString(userMessage.content) : '';
+  }
 
-// Helper method to optimize prompt for direct questions
-optimizePromptForDirectQuestion(question) {
-  return `Answer the following question directly without using any tools:\n\n${question}`;
-}
+  // Helper method to optimize prompt for direct questions
+  optimizePromptForDirectQuestion(question) {
+    return `Answer the following question directly without using any tools:\n\n${question}`;
+  }
 
 
   processAndOptimizeRequest(messages, requestedMaxTokens) {
@@ -407,62 +447,62 @@ optimizePromptForDirectQuestion(question) {
    * Enhanced message formatting for Cohere Chat API
    * Properly handles system messages, conversation history, and user input
    */
-formatMessagesForCohereChat(messages) {
-    let preamble = '';
-    let chatHistory = [];
-    let currentMessage = '';
-    
-    // Process messages to separate system, history, and current user message
-    for (let i = 0; i < messages.length; i++) {
-      const message = messages[i];
-      const content = this.extractContentString(message.content).trim();
+  formatMessagesForCohereChat(messages) {
+      let preamble = '';
+      let chatHistory = [];
+      let currentMessage = '';
       
-      if (!content) continue; // Skip empty messages
-      
-      if (message.role === 'system') {
-        // Use system messages as preamble
-        preamble = content;
-      } else if (message.role === 'user') {
-        if (i === messages.length - 1) {
-          // This is the last message, treat it as the current user message
-          currentMessage = content;
-        } else {
-          // Add to history as a user message
+      // Process messages to separate system, history, and current user message
+      for (let i = 0; i < messages.length; i++) {
+        const message = messages[i];
+        const content = this.extractContentString(message.content).trim();
+        
+        if (!content) continue; // Skip empty messages
+        
+        if (message.role === 'system') {
+          // Use system messages as preamble
+          preamble = content;
+        } else if (message.role === 'user') {
+          if (i === messages.length - 1) {
+            // This is the last message, treat it as the current user message
+            currentMessage = content;
+          } else {
+            // Add to history as a user message
+            chatHistory.push({
+              role: 'USER',
+              message: content
+            });
+          }
+        } else if (message.role === 'assistant') {
+          // Add assistant responses to history
           chatHistory.push({
-            role: 'USER',
+            role: 'CHATBOT',
             message: content
           });
         }
-      } else if (message.role === 'assistant') {
-        // Add assistant responses to history
-        chatHistory.push({
-          role: 'CHATBOT',
-          message: content
-        });
       }
-    }
-    
-    // If no current message was found, use the last user message from history
-    if (!currentMessage && chatHistory.length > 0) {
-      const lastUserMessage = chatHistory.filter(msg => msg.role === 'USER').pop();
-      if (lastUserMessage) {
-        currentMessage = lastUserMessage.message;
-        // Remove it from history since it's now the current message
-        chatHistory = chatHistory.filter(msg => msg !== lastUserMessage);
+      
+      // If no current message was found, use the last user message from history
+      if (!currentMessage && chatHistory.length > 0) {
+        const lastUserMessage = chatHistory.filter(msg => msg.role === 'USER').pop();
+        if (lastUserMessage) {
+          currentMessage = lastUserMessage.message;
+          // Remove it from history since it's now the current message
+          chatHistory = chatHistory.filter(msg => msg !== lastUserMessage);
+        }
       }
+      
+      // Fallback if still no current message
+      if (!currentMessage) {
+        currentMessage = "Please provide a response.";
+      }
+      
+      return {
+        message: currentMessage,
+        chatHistory: chatHistory,
+        preamble: preamble || undefined
+      };
     }
-    
-    // Fallback if still no current message
-    if (!currentMessage) {
-      currentMessage = "Please provide a response.";
-    }
-    
-    return {
-      message: currentMessage,
-      chatHistory: chatHistory,
-      preamble: preamble || undefined
-    };
-  }
 
 
   /**
