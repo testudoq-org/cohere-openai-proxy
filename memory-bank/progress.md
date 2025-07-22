@@ -18,6 +18,7 @@ The Cohere Proxy Server is now a robust, stateless, and scalable service with mo
 - Token usage estimation, overflow handling, and request tracking
 - In-memory caching for prompt responses
 - Fallback to default models if Cohere API is unavailable
+- Retrieval-Augmented Generation (RAG): Integrated document retrieval and context injection for enhanced, knowledge-grounded responses
 - Modern JavaScript: deprecated methods replaced, clean destructuring, and best practices throughout
 - Clear, actionable documentation and configuration guides
 
@@ -28,6 +29,7 @@ The Cohere Proxy Server is now a robust, stateless, and scalable service with mo
 - **Security:** All configuration via environment variables; no sensitive data in logs
 - **Monitoring:** Health endpoint, structured logging, performance metrics
 - **Testing:** Unit/integration tests, modular design
+- **RAG Integration:** The system now supports retrieval-augmented generation, injecting relevant documents into conversation context for improved, knowledge-grounded responses.
 - **Deployment:** Graceful shutdown, health checks, Docker support
 
 ## Configuration

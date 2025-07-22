@@ -26,6 +26,13 @@ Enable multi-turn conversations by maintaining conversation history, associating
 - Restrict multi-turn session logic to chat-capable models only (e.g., command-r, command-r-plus).
 
 ---
+## 3a. RAG Context Injection
+
+- For each user message, the system retrieves relevant documents using the RAGDocumentManager.
+- Retrieved documents are formatted and injected into the conversation history as additional context.
+- The augmented conversation (history + RAG context) is sent to Cohere for response generation.
+- This enables responses that are both conversationally coherent and grounded in external knowledge.
+---
 
 ## 3. Robust Session & Error Handling
 

@@ -5,6 +5,54 @@
 The Cohere Proxy Server translates OpenAI-compatible requests to Cohere's API, providing token estimation, dynamic model support, robust error handling, and production-grade reliability.
 
 ## Architecture
+## Retrieval-Augmented Generation (RAG) Architecture
+
+- **RAGDocumentManager**: Handles indexing, semantic and keyword search, and retrieval of relevant documents from the codebase or knowledge sources.
+- **Integration Points**: RAG is invoked during chat/completion requests. The conversation manager retrieves relevant documents for each user query and injects them as context into the conversation history.
+- **Flow**:
+  1. User sends a chat/completion request.
+  2. The system extracts the query and calls `retrieveRelevantDocuments` on the RAGDocumentManager.
+### RAGDocumentManager Class
+
+The `RAGDocumentManager` is responsible for managing the retrieval-augmented knowledge base. Its main responsibilities include:
+
+- **Indexing**: Scans files and directories, splits content into chunks, and stores metadata for efficient retrieval.
+- **Semantic Search**: Uses embeddings to find documents relevant to a query based on meaning.
+- **Keyword Search**: Performs fast keyword-based lookups for additional recall.
+- **Retrieval**: Combines semantic and keyword results, deduplicates, and ranks them for relevance.
+- **Utilities**: Includes language detection, file categorization, and extraction of functions/classes/imports for enhanced indexing.
+
+#### RAG Integration Sequence
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant ProxyServer
+    participant RAGDocumentManager
+    participant CohereAPI
+
+    User->>ProxyServer: Chat/completion request
+    ProxyServer->>RAGDocumentManager: retrieveRelevantDocuments(query)
+    RAGDocumentManager-->>ProxyServer: Relevant documents
+    ProxyServer->>CohereAPI: Augmented context (history + RAG docs)
+    CohereAPI-->>ProxyServer: Response
+    ProxyServer-->>User: Reply with RAG context
+```
+Key methods:
+- `indexCodebase(projectPath, options)`: Indexes an entire codebase.
+- `indexFile(filePath)`: Indexes a single file.
+- `retrieveRelevantDocuments(query, options)`: Retrieves and ranks relevant documents for a query.
+- `semanticSearch(query, options)`: Embedding-based search.
+- `keywordSearch(query, options)`: Keyword-based search.
+- `getEmbedding(text)`: Gets vector embeddings for text.
+- `getStats()`: Returns index statistics.
+
+This class is central to the RAG workflow, enabling dynamic, context-aware augmentation of user queries.
+  3. Retrieved documents are formatted and injected into the conversation context.
+  4. The augmented context is sent to the Cohere API for response generation.
+  5. The response is returned to the user, with RAG context included in the session history.
+
+This architecture enables dynamic, context-aware responses by leveraging both conversation history and relevant external knowledge.
 
 - **Stateless, horizontally scalable, Docker-ready**
 - **Endpoints:** `/v1/chat/completions`, `/health`
