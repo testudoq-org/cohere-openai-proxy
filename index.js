@@ -129,50 +129,85 @@ class CohereProxyServer {
     return Buffer.from(base).toString('base64');
   }
 
-  // Refactored: Reduced cognitive complexity by extracting methods
   async handleChatCompletion(req, res) {
-    const startTime = Date.now();
+  const startTime = Date.now();
+  console.log('[INFO] Received request:', req.body);
 
-    try {
-      const requestData = this.validateAndExtractRequest(req.body);
-      if (requestData.error) {
-        return res.status(400).json({ error: requestData.error });
-      }
-
-      const { messages, temperature, requestedMaxTokens, model, sessionId } = requestData;
-      
-      const userQuestion = this.extractUserQuestion(messages);
-      const optimizedPrompt = this.optimizePromptForDirectQuestion(userQuestion);
-      const promptTokens = this.estimateTokens(optimizedPrompt);
-      const completionTokens = this.calculateOptimalCompletionTokens(promptTokens, requestedMaxTokens);
-
-      const cacheKey = this.generateCacheKey({
-        model,
-        optimizedPrompt,
-        temperature,
-        maxTokens: completionTokens,
-        sessionId,
-        messages
-      });
-
-      // Check cache first
-      const cached = this.promptCache.get(cacheKey);
-      if (cached) {
-        console.log('[CACHE] Hit for key:', cacheKey);
-        return res.json({ ...cached, cache: true });
-      }
-
-      // Make API call and handle response
-      const response = await this.callCohereAPI(model, optimizedPrompt, temperature, completionTokens);
-      const completionResponse = this.formatResponse(response, model, promptTokens, startTime);
-
-      this.promptCache.set(cacheKey, completionResponse);
-      res.json(completionResponse);
-
-    } catch (error) {
-      this.handleAPIError(error, res, startTime);
+  try {
+    const requestData = this.validateAndExtractRequest(req.body);
+    console.log('[DEBUG] Request data validated and extracted:', requestData);
+    if (!requestData || requestData.error) {
+      const error = requestData?.error || { message: 'Invalid request data', type: 'invalid_request_error' };
+      console.warn('[WARN] Validation error:', error);
+      return res.status(400).json({ error });
     }
+
+    const { messages, temperature, requestedMaxTokens, model, sessionId } = requestData;
+
+    const userQuestion = this.extractUserQuestion(messages);
+    console.log('[DEBUG] Extracted user question:', userQuestion);
+    if (!userQuestion) {
+      console.warn('[WARN] Invalid user question');
+      return res.status(400).json({
+        error: { message: 'Invalid user question', type: 'invalid_request_error' }
+      });
+    }
+
+    const optimizedPrompt = this.optimizePromptForDirectQuestion(userQuestion);
+    console.log('[DEBUG] Optimized prompt:', optimizedPrompt);
+    if (!optimizedPrompt) {
+      console.error('[ERROR] Failed to optimize prompt');
+      return res.status(500).json({
+        error: { message: 'Failed to optimize prompt', type: 'internal_server_error' }
+      });
+    }
+
+    const promptTokens = this.estimateTokens(optimizedPrompt);
+    console.log('[DEBUG] Estimated prompt tokens:', promptTokens);
+    const completionTokens = this.calculateOptimalCompletionTokens(promptTokens, requestedMaxTokens);
+    console.log('[DEBUG] Calculated completion tokens:', completionTokens);
+
+    const cacheKey = this.generateCacheKey({
+      model,
+      optimizedPrompt,
+      temperature,
+      maxTokens: completionTokens,
+      sessionId,
+      messages
+    });
+
+    const cached = this.promptCache.get(cacheKey);
+    if (cached) {
+      console.log('[CACHE] Hit for key:', cacheKey);
+      return res.json({ ...cached, cache: true });
+    }
+
+    console.log('[INFO] Cache miss, calling Cohere API');
+    const response = await this.callCohereAPI(model, optimizedPrompt, temperature, completionTokens);
+    if (!response) {
+      console.error('[ERROR] Cohere API call returned no response');
+      return res.status(500).json({
+        error: { message: 'Failed to receive response from Cohere API', type: 'internal_server_error' }
+      });
+    }
+    console.log('[DEBUG] API response received:', response);
+
+    const completionResponse = this.formatResponse(response, model, promptTokens, startTime);
+    if (!completionResponse) {
+      console.error('[ERROR] Failed to format response');
+      return res.status(500).json({
+        error: { message: 'Failed to format response', type: 'internal_server_error' }
+      });
+    }
+
+    this.promptCache.set(cacheKey, completionResponse);
+    res.json(completionResponse);
+
+  } catch (error) {
+    console.error('[ERROR] API call failed:', error);
+    this.handleAPIError(error, res, startTime);
   }
+}
 
   validateAndExtractRequest(body) {
     const {
