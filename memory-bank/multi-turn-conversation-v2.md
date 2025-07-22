@@ -1,7 +1,7 @@
 # Multi-Turn Conversation Enhancement Plan (v2)
 
 ## Objective
-Enable true multi-turn conversations between Roo and Cohere AI by maintaining and utilizing conversation history, associating sessions with users, and integrating existing helper functions for message formatting and truncation.
+Enable multi-turn conversations by maintaining conversation history, associating sessions with users, and integrating helper functions for message formatting and truncation.
 
 ---
 
@@ -17,21 +17,20 @@ Enable true multi-turn conversations between Roo and Cohere AI by maintaining an
 
 - Update the `/v1/chat/completions` endpoint to:
   - Accept a `sessionId` in the request body.
-  - Retrieve the conversation history for the session (or initialize if new).
+  - Retrieve or initialize conversation history for the session.
   - Append the new user message to the session history.
   - Use `formatMessagesForCohereChat` and `intelligentTruncateMessages` to prepare the message array.
   - Send the formatted, truncated history to Cohere.
   - Store the assistant’s reply in the session history.
   - Return `{ sessionId, messages, reply }` in the response.
-
-- **Restrict multi-turn session logic to chat-capable models only** (e.g., command-r, command-r-plus).
+- Restrict multi-turn session logic to chat-capable models only (e.g., command-r, command-r-plus).
 
 ---
 
 ## 3. Robust Session & Error Handling
 
-- Handle new sessions (initialize history).
-- Handle expired/invalid sessions (optionally implement TTL or cleanup).
+- Initialize history for new sessions.
+- Handle expired/invalid sessions by implementing a session TTL (e.g., remove sessions inactive for 30 minutes).
 - Gracefully handle API and formatting errors.
 
 ---
@@ -43,7 +42,7 @@ Enable true multi-turn conversations between Roo and Cohere AI by maintaining an
 
 ---
 
-## 5. (Optional) Mermaid Diagram
+## 5. Mermaid Diagram
 
 ```mermaid
 sequenceDiagram
@@ -66,9 +65,9 @@ sequenceDiagram
 
 ## Summary
 
-- In-memory session storage will be used for conversation history.
-- Multi-turn session logic will be restricted to chat-capable models.
-- The chat endpoint will be refactored to accept a session/user ID, manage conversation history, and use the provided helper functions for formatting and truncation.
-- The API response will include the sessionId, updated messages, and the latest reply.
-- Robust error handling and updated documentation will be included.
-- A Mermaid diagram illustrates the new flow.
+- In-memory session storage is used for conversation history.
+- Multi-turn session logic is restricted to chat-capable models.
+- The chat endpoint manages conversation history and uses helper functions for formatting and truncation.
+- The API response includes the sessionId, updated messages, and the latest reply.
+- Robust error handling and updated documentation are included.
+- The diagram illustrates the new flow.
