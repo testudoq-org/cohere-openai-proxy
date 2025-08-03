@@ -7,7 +7,7 @@ const { CohereClient } = require("cohere-ai");
 const rateLimit = require("express-rate-limit");
 const helmet = require("helmet");
 const morgan = require("morgan");
-const { encoding_for_model } = require("tiktoken");
+const { encode, decode } = require('gpt-3-encoder');
 const fs = require("fs").promises;
 const path = require("path");
 const crypto = require("crypto");
@@ -39,7 +39,7 @@ class EnhancedCohereRAGServer {
     this.ragManager = new RAGDocumentManager(this.cohere);
     this.conversationManager = new ConversationManager(this.ragManager);
 
-    this.tokenizer = encoding_for_model("gpt-3.5-turbo");
+    // gpt-3-encoder does not require model selection; use encode/decode directly
     this.supportedModels = new Set();
 
     // Configuration
@@ -587,7 +587,7 @@ class EnhancedCohereRAGServer {
 
   estimateTokens(text) {
     const textString = this.extractContentString(text);
-    return this.tokenizer.encode(textString).length;
+    return encode(textString).length;
   }
 
   generateId() {

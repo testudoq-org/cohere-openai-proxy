@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
+    "start": "node --max-old-space-size=3500 index.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "build:dev": "copyfiles index.js package.json package-lock.json dist/dev",
     "build:prod": "copyfiles index.js package.json package-lock.json dist/prod"
@@ -17,9 +18,9 @@
     "dotenv": "^17.2.0",
     "express": "^5.1.0",
     "express-rate-limit": "^8.0.1",
+    "gpt-3-encoder": "^1.1.4",
     "helmet": "^8.1.0",
-    "morgan": "^1.10.1",
-    "tiktoken": "^1.0.21"
+    "morgan": "^1.10.1"
   },
   "devDependencies": {
     "copyfiles": "^2.4.1"
