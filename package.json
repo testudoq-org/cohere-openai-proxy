@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build:dev": "copyfiles index.js package.json package-lock.json dist/dev",
+    "build:prod": "copyfiles index.js package.json package-lock.json dist/prod"
   },
   "keywords": [],
   "author": "",
@@ -18,5 +20,8 @@
     "helmet": "^8.1.0",
     "morgan": "^1.10.1",
     "tiktoken": "^1.0.21"
+  },
+  "devDependencies": {
+    "copyfiles": "^2.4.1"
   }
 }
