@@ -213,7 +213,11 @@ class EnhancedCohereRAGServer {
 
   async start() {
     await this.initializeSupportedModels();
-    this.server = this.app.listen(this.port, () => logger.info({ port: this.port }, 'Server started'));
+    console.log('start(): about to call app.listen on port', this.port);
+    this.server = this.app.listen(this.port, () => {
+      console.log('start(): app.listen callback fired');
+      logger.info({ port: this.port }, 'Server started');
+    });
     return this.server;
   }
 

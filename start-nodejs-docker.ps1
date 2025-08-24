@@ -23,7 +23,7 @@ if ($Mode -notin @("dev", "prod")) {
 # Build dist/prod if in production mode
 if ($Mode -eq "prod") {
     Write-Host "Building production distribution..." -ForegroundColor Yellow
-    node build-dist.js --prod
+    node build-dist.mjs --prod
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Build failed. Exiting."
         exit 1

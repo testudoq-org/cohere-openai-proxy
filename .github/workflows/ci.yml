@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, feat/** ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Show Node/npm versions
+        run: |
+          node --version
+          npm --version
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build dist (prod)
+        run: node build-dist.mjs --prod
+
+      - name: Verify dist (ESM-only)
+        run: |
+          chmod +x ./scripts/verify-dist.sh || true
+          ./scripts/verify-dist.sh dist/prod
+
+      - name: Run tests
+        run: npm test --silent
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs
+          path: |
+            dist/prod
+            npm-debug.log
+            yarn-error.log

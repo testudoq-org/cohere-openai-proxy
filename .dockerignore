@@ -39,7 +39,7 @@ README.md
 
 # Scripts (not needed in container)
 start-nodejs-docker.ps1
-build-dist.js
+build-dist.mjs
 
 # Logs
 *.log
