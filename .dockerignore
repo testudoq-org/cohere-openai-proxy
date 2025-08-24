@@ -35,9 +35,7 @@ Thumbs.db
 .gitignore
 README.md
 
-# Docker files
-Dockerfile*
-docker-compose*
+# Docker files (keep in context)
 
 # Scripts (not needed in container)
 start-nodejs-docker.ps1

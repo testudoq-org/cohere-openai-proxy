@@ -19,179 +19,63 @@
 **Task 3: Data Protection** ⚠️ URGENT
 - Encrypt sensitive data in memory caches (`MemoryCache` class)
 - Implement secure session token generation in `generateId` method (line 573)
-- Add data retention policies for conversation history and RAG documents
-- Secure API key storage and rotation mechanisms
+```markdown
+# Enhancement implementation summary (updated)
 
-### 🔴 Phase 2: Core Stability (Weeks 2-3)
+This document maps recent, implemented changes to the roadmap and lists the highest-priority follow-ups.
 
-**Task 13: Error Handling Enhancement** 🔧 STABILITY
-- Implement standardized error response format across all endpoints
-- Add detailed error logging with correlation IDs
-- Create custom exception classes for different error types
-- Improve error recovery mechanisms in `handleAPIError` method (line 529-563)
+Summary of implemented changes
 
-**Task 4: Rate Limiting & DDoS Protection** 🔧 STABILITY
-- Enhance rate limiting with user-specific quotas beyond current IP-based limits (line 104-112)
-- Implement circuit breakers for external API calls in `callCohereChatAPI` (line 458-510)
-- Add request queuing and prioritization for heavy RAG operations
-- Implement abuse detection for rapid indexing requests
+- ESM migration: repository now runs as ES Modules. `package.json` includes "type": "module" and the runtime entry is `src/index.mjs`.
+- Background indexing: `RAGDocumentManager.indexCodebase()` enqueues indexing jobs; indexing runs asynchronously off the HTTP request path to avoid blocking.
+- Embedding cache: a small LRU+TTL cache lives in `src/utils/lruTtlCache.mjs`; embeddings are cached by hash (md5) to reduce API calls and latency.
+- Semantic + fallback retrieval: semantic search uses cached embeddings; when embeddings are missing or an error occurs, the manager falls back to keyword-based search.
+- Conversation manager: `ConversationManager` maintains session history with LRU-based pruning and exposes graceful shutdown hooks to avoid memory leaks.
+- Structured logging & metrics: `pino` for structured logs and `prom-client` basics (HTTP counters) were added.
+- Tests: Vitest unit tests and Supertest-based endpoint tests were added for core behavior (RAG manager, conversation manager, key HTTP endpoints).
+- Docker & build: `build-dist.mjs` produces a `dist` layout; Dockerfile and `docker-compose.yml` were updated to run the ESM entrypoint (`node src/index.mjs`).
 
-## HIGH PRIORITY (Next Phase - Critical for Scale)
+What was intentionally deferred (kept out of the ESM PR)
 
-### 🟠 Phase 3: Performance Foundation (Weeks 4-6)
+- Full schema validation (Zod/Ajv) and strict API contract enforcement — planned as a follow-up.
+- A production-grade circuit-breaker library around external API calls — basic retry logic exists but a full breaker is pending.
+- Persistent vector DB (Pinecone/Weaviate) integration and multi-instance distributed caching (Redis) — planned as a separate migration.
+- SSE streaming chat and advanced streaming partial-response handling — considered lower-risk follow-up.
 
-**Task 6: Database Integration** 📊 PERFORMANCE
-- Replace in-memory document storage with persistent database (PostgreSQL/MongoDB)
-- Implement vector database integration (Pinecone/Weaviate) for embedding storage
-- Add database connection pooling and query optimization
-- Implement proper indexing strategies for document retrieval
+Prioritized next actions (short list)
 
-**Task 5: Caching Strategy Enhancement** ⚡ PERFORMANCE
-- Implement Redis-based distributed caching to replace in-memory `MemoryCache`
-- Add semantic search result caching in `semanticSearch` method (line 305-334)
-- Implement embedding batch processing in `getEmbedding` method (line 378-417)
-- Add conversation history compression for large sessions
+1) Security & validation (high priority)
+	- Add request schema validation for all public endpoints (AJV or Zod).
+	- Add API-key auth middleware for admin/RAG operations and tighten allowed paths in `indexCodebase`.
 
-**Task 8: Memory Management** ⚡ PERFORMANCE
-- Implement memory-efficient chunking strategy in `splitIntoChunks` method (line 436-455)
-- Add garbage collection optimization for large document processing
-- Implement streaming file reading for large codebases
-- Add memory usage monitoring and automatic cleanup
+2) Reliability & infra
+	- Integrate a circuit breaker + retries around Cohere API calls and add unit tests for fallback behavior.
+	- Expand Prometheus metrics (latency, token usage, embeddings cache hit rate) and add readiness/liveness endpoints.
 
-### 🟠 Phase 4: Scalability Infrastructure (Weeks 6-8)
+3) Scale & persistence
+	- Design and add a small abstraction layer so the RAG store can be switched from the in-memory store to Pinecone/Weaviate.
+	- Add Redis for distributed embedding/result caching for multi-instance environments.
 
-**Task 7: Asynchronous Processing** 🚀 SCALABILITY
-- Convert synchronous file indexing to background job queue in `indexCodebase` method (line 83-139)
-- Implement streaming responses for large document retrievals
-- Add parallel processing for multiple file indexing operations
-- Use worker threads for CPU-intensive embedding calculations
+4) Tests & CI
+	- Increase test coverage, add CI to run Vitest, and publish coverage reports.
 
-**Task 11: Monitoring & Observability** 📈 OPERATIONS
-- Implement comprehensive logging with structured format
-- Add distributed tracing for request flow monitoring
-- Create metrics collection for performance monitoring
-- Implement alerting system for service degradation
+Quick status / checklist (mapping user requests to status)
 
-**Task 12: Configuration Management** ⚙️ OPERATIONS
-- Replace hardcoded configurations with environment-based config
-- Implement feature flags for experimental functionality
-- Add runtime configuration updates without service restart
-- Create configuration validation and schema enforcement
+- Convert repo to ESM: Done
+- Separate services / non-blocking indexing: Done (background queue for indexing)
+- Embedding caching: Done (LRU+TTL cache)
+- Semantic fallback: Done (embedding-first, keyword fallback)
+- Structured logging + basic metrics: Done (pino + prom-client stub)
+- Graceful shutdown + session pruning: Done
+- Circuit breaker + advanced retries: Deferred (basic retries present)
+- SSE streaming for chat: Deferred
+- Full schema validation and per-user rate limiting: Deferred (placeholders exist)
+- Tests (Vitest + Supertest): Done (core unit + endpoint tests added)
 
-## MEDIUM PRIORITY (Quality & Maintainability)
+Notes
 
-### 🟡 Phase 5: Code Quality (Weeks 9-11)
+- Changes were intentionally grouped to keep the first PR focused and reviewable: ESM, background indexing, cache and basic observability.
+- Follow-up PRs should be smaller and scoped: (1) schema validation + API auth, (2) circuit breaker + retries, (3) persistent vector DB + Redis.
 
-**Task 14: Testing Strategy** ✅ QUALITY
-- Create comprehensive unit test suite for all classes and methods
-- Implement integration tests for RAG functionality
-- Add performance benchmarking tests
-- Create API contract testing with mock services
-
-**Task 15: Documentation & Developer Experience** 📚 QUALITY
-- Generate comprehensive API documentation
-- Create developer guides for RAG integration
-- Add inline code documentation and JSDoc comments
-- Create example implementations and use cases
-
-**Task 10: API Gateway Integration** 🌐 ARCHITECTURE
-- Add OpenAPI/Swagger documentation generation
-- Implement request/response transformation middleware
-- Add API versioning strategy
-- Create webhook support for real-time updates
-
-### 🟡 Phase 6: Architecture Evolution (Weeks 12-14)
-
-**Task 9: Microservices Architecture** 🏗️ ARCHITECTURE
-- Separate RAG document management into independent service
-- Create dedicated conversation management service
-- Implement service mesh for inter-service communication
-- Add health check endpoints for all services
-
-**Task 20: Container & Orchestration** 🐳 DEPLOYMENT
-- Create optimized Docker containers for each service
-- Implement Kubernetes deployment manifests
-- Add horizontal pod autoscaling based on load
-- Create helm charts for easy deployment
-
-**Task 21: CI/CD Pipeline** 🔄 DEPLOYMENT
-- Implement automated testing pipeline
-- Add security scanning for vulnerabilities
-- Create automated deployment with rollback capabilities
-- Implement blue-green deployment strategy
-
-## LOW PRIORITY (Advanced Features)
-
-### 🟢 Phase 7: Advanced RAG Features (Weeks 15-18)
-
-**Task 16: Intelligent Document Processing** 🧠 ENHANCEMENT
-- Enhance code parsing in `extractFunctions`, `extractClasses`, `extractImports` methods (line 465-517)
-- Implement AST-based code analysis for better context extraction
-- Add support for additional programming languages and file types
-- Create intelligent chunking based on code structure rather than character count
-
-**Task 17: Advanced Retrieval Strategies** 🔍 ENHANCEMENT
-- Implement hybrid search combining semantic and keyword search
-- Add query expansion and synonym handling
-- Create relevance feedback learning system
-- Implement multi-modal retrieval for code and documentation
-
-**Task 18: Context-Aware Response Generation** 🤖 ENHANCEMENT
-- Enhance prompt engineering in `buildEnhancedPreamble` method (line 169-195)
-- Implement conversation context summarization for long sessions
-- Add code generation templates based on project patterns
-- Create intelligent context window management
-
-### 🟢 Phase 8: Advanced Operations (Weeks 19-22)
-
-**Task 19: Real-time Synchronization** ⚡ ENHANCEMENT
-- Implement file system watching for automatic codebase updates
-- Add incremental indexing for changed files only
-- Create real-time collaboration features
-- Implement conflict resolution for concurrent modifications
-
-**Task 22: Backup & Recovery** 💾 OPERATIONS
-- Implement automated backup for indexed documents and conversations
-- Create disaster recovery procedures
-- Add data migration tools for version upgrades
-- Implement point-in-time recovery capabilities
-
-## Implementation Strategy
-
-### Sprint Planning (2-week sprints)
-
-**Sprints 1-2**: Security vulnerabilities and core stability
-**Sprints 3-4**: Performance foundation and database integration
-**Sprints 5-6**: Scalability infrastructure and monitoring
-**Sprints 7-8**: Code quality and testing
-**Sprints 9-10**: Architecture evolution and deployment
-**Sprints 11+**: Advanced features and enhancements
-
-### Success Metrics by Phase
-
-**Phase 1-2 (Critical)**
-- Zero security vulnerabilities in penetration testing
-- 99.9% uptime with proper error handling
-- Authentication system protecting all endpoints
-
-**Phase 3-4 (High)**
-- 10x improvement in response times
-- Support for 1000+ concurrent users
-- 99.95% uptime with monitoring alerts
-
-**Phase 5-6 (Medium)**
-- 90%+ code coverage
-- Automated deployments with <5 min rollback
-- Complete API documentation
-
-**Phase 7-8 (Low)**
-- Advanced RAG features improving accuracy by 25%
-- Real-time updates with <1s latency
-- Disaster recovery tested and validated
-
-### Risk Mitigation
-
-- **Critical Phase**: Daily standups, immediate security reviews
-- **High Phase**: Weekly performance benchmarks, load testing
-- **Medium Phase**: Code reviews, documentation validation
-- **Low Phase**: User feedback integration, performance monitoring
+If you'd like, I can now open follow-up PR drafts for each of the next three prioritized items and prepare checklists and unit tests for them.
+```

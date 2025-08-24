@@ -28,7 +28,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: production
     image: cohere-app:dev
     container_name: cohere-app-dev
     ports:
@@ -41,6 +40,7 @@ services:
     volumes:
       - ./:/app
       - /app/node_modules
+    command: ["npm","run","start:dev"]
     restart: unless-stopped
     profiles:
       - dev
@@ -67,8 +67,9 @@ services:
       - "3000:3000"
     environment:
       - NODE_ENV=production
+    # Use top-level .env by default; production secrets should be provided by secret manager
     env_file:
-      - dist/prod/.env
+      - .env
     restart: unless-stopped
     profiles:
       - prod

@@ -4,9 +4,25 @@
 
 The Cohere Proxy Server translates OpenAI-compatible requests to Cohere's API, providing token estimation, dynamic model support, robust error handling, and production-grade reliability.
 
-## Architecture
-## Retrieval-Augmented Generation (RAG) Architecture
+# Architecture
 
+This repository moved from a single-file CommonJS layout to a small ESM-based service split under `src/`.
+
+High level components
+- `src/index.mjs` — HTTP server, routes and wiring. Exposes the same public endpoints (`/v1/chat/completions`, `/v1/rag/*`, `/v1/conversations/*`) so clients and integrations remain compatible.
+- `src/ragDocumentManager.mjs` — RAG document store and index. Indexing is now queue-based and runs off the request path to avoid blocking web requests. Embeddings are cached using an LRU+TTL cache.
+- `src/conversationManager.mjs` — Conversation state, RAG context enrichment, and session lifecycle. Uses pruning/LRU to avoid unbounded memory growth and exposes graceful shutdown hooks.
+- `src/utils/lruTtlCache.mjs` — Small in-repo LRU TTL cache used for embeddings and prompt caching. Replaces the older `memoryCache.js`.
+
+Observability and infra
+- Structured logging with `pino` inserted into the request context for correlation.
+- Basic Prometheus metrics stub using `prom-client` (counter for HTTP requests). Expand as needed.
+- Health endpoint (`GET /health`) that reports conversation and rag stats and basic limits.
+
+Design notes
+- Indexing and embedding calls are performed asynchronously: `indexCodebase()` enqueues a job and the manager processes that queue in the background.
+- Semantic search prefers cached document embeddings; on failure it falls back to fast keyword search.
+- The server keeps backwards-compatible request/response shapes for ease of migration.
 - **RAGDocumentManager**: Handles indexing, semantic and keyword search, and retrieval of relevant documents from the codebase or knowledge sources.
 - **Integration Points**: RAG is invoked during chat/completion requests. The conversation manager retrieves relevant documents for each user query and injects them as context into the conversation history.
 - **Flow**:

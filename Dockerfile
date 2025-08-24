@@ -23,7 +23,7 @@ RUN npm -v || true
 RUN echo "--- /app contents ---" && ls -la /app || true
 
 # Fail fast if required runtime files are missing
-RUN (for f in index.js memoryCache.js ragDocumentManager.js conversationManager.js package.json; do \
+RUN (for f in src/index.mjs src/ragDocumentManager.mjs src/conversationManager.mjs src/utils/lruTtlCache.mjs package.json; do \
 			if [ ! -f "/app/$f" ]; then echo "[BUILD ERROR] Missing required file: /app/$f" >&2; exit 2; fi; \
 		done) \
 		&& echo "[BUILD OK] All required runtime files present."
@@ -45,8 +45,9 @@ USER node
 # Expose port 3000 for application traffic
 EXPOSE 3000
 
-# Start the app using npm start (production entrypoint)
-CMD ["npm", "start"]
+# Start the app directly using the ESM entry (src/index.mjs)
+# Using node directly avoids relying on a root index.js and works with the dist/prod layout created by build-dist.mjs
+CMD ["node", "src/index.mjs"]
 
 # --- Notes ---
 # - We copy package.json first so `npm ci` uses Docker cache when dependencies don't change
