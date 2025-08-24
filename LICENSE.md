@@ -17,3 +17,5 @@ Adaptations must be shared under the same terms.
 
 **See the License Deed**  
 [https://creativecommons.org/licenses/by-nc-sa/4.0/](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+
+👉 Full details: LEGAL.md
