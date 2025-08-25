@@ -153,35 +153,20 @@ testudoq: Review the docker build for the application, and suggest how we can co
 
 Comprehensively review and improve the code around the docker build.
 
-Debug and fix following issue - PS D:\Code\Temp\cohere-openai-proxy> docker logs cohere-app
-[dotenv@17.2.0] injecting env (0) from .env (tip: ⚙️  load multiple .env files with { path: ['.env.local', '.env'] })
-node:internal/modules/cjs/loader:1215
-  throw err;
-  ^
+Note: the project now uses ES modules under `src/` (for example `src/index.mjs`, `src/ragDocumentManager.mjs`, `src/conversationManager.mjs`). If you see runtime errors referencing `/app/index.js` or `./memoryCache`, it means you are running an old image or a container that was started with a host bind-mount that masked the image content. To fix, rebuild and run the updated image:
 
-Error: Cannot find module './memoryCache'
-Require stack:
-- /app/index.js
-    at Module._resolveFilename (node:internal/modules/cjs/loader:1212:15)
-    at Module._load (node:internal/modules/cjs/loader:1043:27)
-    at Module.require (node:internal/modules/cjs/loader:1298:19)
-    at require (node:internal/modules/helpers:182:18)
-    at Object.<anonymous> (/app/index.js:23:21)
-    at Module._compile (node:internal/modules/cjs/loader:1529:14)
-    at Module._extensions..js (node:internal/modules/cjs/loader:1613:10)
-    at Module.load (node:internal/modules/cjs/loader:1275:32)
-    at Module._load (node:internal/modules/cjs/loader:1096:12)
-    at Function.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:164:12) {
-  code: 'MODULE_NOT_FOUND',
-  requireStack: [ '/app/src/index.mjs' ]
-}
+```powershell
+node build-dist.mjs --prod
+docker build -t cohere-app:prod .
+docker rm -f cohere-app 2>$null
+docker run -d --name cohere-app -p 3000:3000 --env-file dist/prod/.env cohere-app:prod
+```
 
-GitHub Copilot: Enable GPT-5 mini (Preview) for all clients
-[object Object]
+Use the included PowerShell helper if you prefer:
 
-testudoq: @agent Enable: "Enable GPT-5 mini (Preview) for all clients"
-
-GitHub Copilot: I'll read the app's index.js and the prod package files to see how modules are required and which files must be present in the image; expected outcome: identify missing file paths or mismatched require names. I'll fetch index.js, index.js, and package.json. I'll search the repository for local require(...) patterns to verify which files must be present in the image. Expected outcome: list of local modules index.js needs. I'll read memoryCache.js, conversationManager.js, and ragDocumentManager.js in the repo to confirm their exports and filenames; outcome: ensure files exist and are correct. I'll list the prod folder to confirm which files exist there and whether memoryCache.js is present; expected outcome: confirm presence or absence of the required files. I'll update the Dockerfile to reliably copy the entire prod folder, install dependencies with proper cache layering, set file ownership, and add build-time verification output. Expected outcome: image will contain all prod files (including memoryCache.js) and be more robust. 
+```powershell
+.\start-nodejs-docker.ps1 -Mode prod -Action run -Rebuild -WaitForHealth -HealthTimeoutSeconds 90
+```
 ```
 
 
