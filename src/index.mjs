@@ -14,6 +14,7 @@ const require = createRequire(import.meta.url);
 
 import Pino from 'pino';
 import promClient from 'prom-client';
+import { createStartupWatchdog } from './utils/startupWatchdog.mjs';
 
 import LruTtlCache from './utils/lruTtlCache.mjs';
 import RAGDocumentManager from './ragDocumentManager.mjs';
@@ -212,9 +213,21 @@ class EnhancedCohereRAGServer {
   }
 
   async start() {
-    await this.initializeSupportedModels();
-    this.server = this.app.listen(this.port, () => logger.info({ port: this.port }, 'Server started'));
-    return this.server;
+    const watchdog = createStartupWatchdog({ timeoutMs: Number(process.env.STARTUP_TIMEOUT_MS) || 30000, intervalMs: 5000 });
+    watchdog.start();
+    try {
+      await this.initializeSupportedModels();
+      console.log('start(): about to call app.listen on port', this.port);
+      this.server = this.app.listen(this.port, () => {
+        console.log('start(): app.listen callback fired');
+        logger.info({ port: this.port }, 'Server started');
+        watchdog.clear();
+      });
+      return this.server;
+    } catch (err) {
+      watchdog.clear();
+      throw err;
+    }
   }
 
   async stop() {
@@ -226,7 +239,9 @@ class EnhancedCohereRAGServer {
 
 export default EnhancedCohereRAGServer;
 
-if (process.argv[1]?.endsWith('src/index.mjs')) {
+// Robust entry-point detection: compare resolved paths so this works on Windows (backslashes)
+const _entryPath = fileURLToPath(import.meta.url);
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(_entryPath)) {
   const server = new EnhancedCohereRAGServer();
   server.start().catch((err) => {
     logger.error({ err }, 'Failed to start server');

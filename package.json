@@ -30,6 +30,6 @@
   "devDependencies": {
   "copyfiles": "^2.4.1",
   "vitest": "^1.6.1",
-  "supertest": "^6.4.3"
+  "supertest": "^6.3.3"
   }
 }

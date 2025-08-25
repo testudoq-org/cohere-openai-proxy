@@ -44,5 +44,5 @@ echo Using port %PORT%
 
 REM Start the server
 echo Starting the server...
-node index.js
+node src/index.mjs
 endlocal

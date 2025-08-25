@@ -1,20 +1,21 @@
-# Production Deployment Structure
+# Production Deployment Structure (MIGRATED — OUTDATED)
+
+This document previously described a legacy CommonJS layout. The repository has been migrated to ES Modules (ESM). The canonical runtime is now under `src/` and build outputs are produced by `build-dist.mjs` into `dist/prod`.
 
 All application files should reside in `/cop` on the production webhost.
 
-**Directory layout:**
+**Directory layout (ESM):**
 ```
 /cop/
-  index.js
-  memoryCache.js
-  ragDocumentManager.js
-  conversationManager.js
+  src/index.mjs
+  src/ragDocumentManager.mjs
+  src/conversationManager.mjs
   package.json
   node_modules/   (symlink or actual directory)
   .env            (your environment variables)
 ```
 
-- Use the `build-dist.sh` script to prepare the files for deployment.
+- Use the `build-dist.mjs` script to prepare the files for deployment (creates `dist/prod`).
 - Copy the contents of `dist/prod` to `/cop` on your production server.
 - Ensure `node_modules` is present in `/cop` (can be a symlink to a shared location).
 - Place your `.env` file in `/cop` with the required environment variables.
@@ -30,3 +31,4 @@ This ensures your environment variables are available and avoids issues with `.d
 ```sh
 cd /cop
 npm start
+```

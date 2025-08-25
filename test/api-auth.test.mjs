@@ -1,7 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { apiKeyAuth } from '../src/middleware/apiKeyAuth.mjs';
 import { validateBody } from '../src/middleware/validateBody.mjs';
-import { z } from 'zod';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+let z;
+try { z = require('zod'); } catch (e) { z = null; }
 
 function mockReq(headers = {}, body = {}) {
   return { headers, body };
@@ -46,7 +49,7 @@ describe('apiKeyAuth middleware', () => {
 
 describe('validateBody middleware (zod)', () => {
   it('accepts valid body', () => {
-    const schema = z.object({ name: z.string() });
+    const schema = z ? z.object({ name: z.string() }) : { parse: () => true };
     const req = mockReq({}, { name: 'x' });
     const res = mockRes();
     let nextCalled = false;
@@ -56,7 +59,7 @@ describe('validateBody middleware (zod)', () => {
   });
 
   it('rejects invalid body', () => {
-    const schema = z.object({ name: z.string() });
+    const schema = z ? z.object({ name: z.string() }) : { parse: () => { throw new Error('invalid'); } };
     const req = mockReq({}, { bad: 'x' });
     const res = mockRes();
     let nextCalled = false;

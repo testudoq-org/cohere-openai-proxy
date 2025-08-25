@@ -72,7 +72,7 @@ This architecture enables dynamic, context-aware responses by leveraging both co
 
 - **Stateless, horizontally scalable, Docker-ready**
 - **Endpoints:** `/v1/chat/completions`, `/health`
-- **Class-based design:** [`CohereProxyServer`](../index.js:22) manages all server logic
+- **Class-based design:** [`CohereProxyServer`](../src/index.mjs:22) manages all server logic
 - **Async Initialization:** Supported models are fetched asynchronously in the `start` method, not in the constructor, ensuring proper startup sequencing.
 - **Modular Handlers:** Request processing is broken into small, focused methods for validation, transformation, API calls, error handling, and response formatting.
 
