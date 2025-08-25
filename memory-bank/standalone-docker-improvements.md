@@ -6,7 +6,7 @@
 - Add `setup.sh` (bash) and `setup.bat` (batch) scripts:
   - Automate `npm install`
   - Guide user to create/edit `.env`
-  - Start the server (`npm start` or `node index.js`)
+  - Start the server (`npm start` or `node src/index.mjs`)
 - Update [`README.md`](../README.md) with:
   - Clear install/start instructions for both platforms
   - Troubleshooting and health check usage

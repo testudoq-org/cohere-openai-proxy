@@ -2,7 +2,9 @@
 param(
     [string]$Mode = "prod",
     [string]$Action = "run",
-    [switch]$Rebuild
+    [switch]$Rebuild,
+    [switch]$WaitForHealth,
+    [int]$HealthTimeoutSeconds = 60
 )
 
 # Configuration
@@ -23,7 +25,7 @@ if ($Mode -notin @("dev", "prod")) {
 # Build dist/prod if in production mode
 if ($Mode -eq "prod") {
     Write-Host "Building production distribution..." -ForegroundColor Yellow
-    node build-dist.js --prod
+    node build-dist.mjs --prod
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Build failed. Exiting."
         exit 1
@@ -137,6 +139,27 @@ switch ($Action.ToLower()) {
             Write-Host "Container started successfully!" -ForegroundColor Green
             Write-Host "Access your app at: http://localhost:$hostPort" -ForegroundColor Cyan
             Write-Host "Health check: http://localhost:$hostPort/health" -ForegroundColor Cyan
+            if ($WaitForHealth) {
+                Write-Host "Waiting for container health (timeout: ${HealthTimeoutSeconds}s)" -ForegroundColor Yellow
+                $endTime = (Get-Date).AddSeconds($HealthTimeoutSeconds)
+                while ((Get-Date) -lt $endTime) {
+                    try {
+                        $resp = Invoke-RestMethod -Uri "http://localhost:$hostPort/health" -Method Get -ErrorAction Stop -TimeoutSec 5
+                        if ($resp -and $resp.status -eq 'healthy') {
+                            Write-Host "Container reported healthy" -ForegroundColor Green
+                            break
+                        }
+                    } catch {
+                        # ignore and retry
+                    }
+                    Start-Sleep -Seconds 2
+                }
+                if ((Get-Date) -ge $endTime) {
+                    Write-Error "Timed out waiting for health endpoint"
+                    docker logs --tail 200 $containerName
+                    exit 2
+                }
+            }
         }
     }
     "stop" {

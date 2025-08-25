@@ -1,12 +1,15 @@
 {
   "name": "cohere-openai-proxy",
   "version": "1.0.0",
-  "main": "index.js",
+  "type": "module",
+  "main": "src/index.mjs",
   "scripts": {
-    "start": "node --max-old-space-size=3500 index.js",
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "build:dev": "copyfiles index.js package.json package-lock.json dist/dev",
-    "build:prod": "copyfiles index.js package.json package-lock.json dist/prod"
+    "start": "node src/index.mjs",
+    "start:dev": "node --enable-source-maps --trace-warnings src/index.mjs",
+    "test": "vitest",
+    "build:dev": "node build-dist.mjs --dev",
+    "build:prod": "node build-dist.mjs --prod",
+    "lint": "echo \"No linter configured\""
   },
   "keywords": [],
   "author": "",
@@ -20,9 +23,13 @@
     "express-rate-limit": "^8.0.1",
     "gpt-3-encoder": "^1.1.4",
     "helmet": "^8.1.0",
-    "morgan": "^1.10.1"
+    "morgan": "^1.10.1",
+    "pino": "^8.20.0",
+    "prom-client": "^14.0.1"
   },
   "devDependencies": {
-    "copyfiles": "^2.4.1"
+  "copyfiles": "^2.4.1",
+  "vitest": "^1.6.1",
+  "supertest": "^6.3.3"
   }
 }

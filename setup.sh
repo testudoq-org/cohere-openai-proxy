@@ -47,4 +47,4 @@ echo "Using port $PORT"
 
 # Start the server
 echo "Starting the server..."
-node index.js
+node src/index.mjs

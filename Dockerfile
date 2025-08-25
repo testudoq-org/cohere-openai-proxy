@@ -7,11 +7,13 @@ FROM node:20-alpine
 WORKDIR /app
 
 # Copy package metadata first to leverage Docker layer caching for npm install
-# Only copy package files from the dist/prod build output.
-COPY dist/prod/package.json dist/prod/package-lock.json ./
+# Use the repository root package.json and package-lock.json (tracked files) so
+# `npm ci` runs deterministically in CI without committing files under dist/.
+COPY package.json package-lock.json ./
 
 # Install only production dependencies for security and efficiency
-RUN npm ci --only=production
+# Try `npm ci` first (preferred). If it fails (lockfile drift), fall back to `npm install`.
+RUN set -o pipefail && npm ci --only=production 2>&1 || (echo "npm ci failed, falling back to npm install --only=production" && npm install --only=production)
 
 # Copy the rest of the application files from dist/prod into the image
 # Use --chown to ensure files are owned by the non-root node user in the final image
@@ -23,7 +25,7 @@ RUN npm -v || true
 RUN echo "--- /app contents ---" && ls -la /app || true
 
 # Fail fast if required runtime files are missing
-RUN (for f in index.js memoryCache.js ragDocumentManager.js conversationManager.js package.json; do \
+RUN (for f in src/index.mjs src/ragDocumentManager.mjs src/conversationManager.mjs src/utils/lruTtlCache.mjs package.json; do \
 			if [ ! -f "/app/$f" ]; then echo "[BUILD ERROR] Missing required file: /app/$f" >&2; exit 2; fi; \
 		done) \
 		&& echo "[BUILD OK] All required runtime files present."
@@ -32,7 +34,8 @@ RUN (for f in index.js memoryCache.js ragDocumentManager.js conversationManager.
 RUN if [ -f ./.env ]; then echo ".env present in image (consider mounting at runtime instead)"; fi || true
 
 # Ensure correct ownership (defensive)
-RUN chown -R node:node /app || true
+## Removed heavy chown -R step (COPY --chown already sets ownership and recursive chown can hang on some filesystems)
+## RUN chown -R node:node /app || true
 
 
 # Non-blocking container healthcheck: call the /health endpoint using node (no extra packages)
@@ -45,8 +48,9 @@ USER node
 # Expose port 3000 for application traffic
 EXPOSE 3000
 
-# Start the app using npm start (production entrypoint)
-CMD ["npm", "start"]
+# Start the app directly using the ESM entry (src/index.mjs)
+# Using node directly avoids relying on a root index.js and works with the dist/prod layout created by build-dist.mjs
+CMD ["node", "src/index.mjs"]
 
 # --- Notes ---
 # - We copy package.json first so `npm ci` uses Docker cache when dependencies don't change

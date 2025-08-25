@@ -1,49 +1,105 @@
 # Project Progress Summary
 
 **Project:** Cohere Proxy Server Enhancement  
-**Status:** Production-ready
+**Status:** In progress (ESM refactor + RAG improvements merged)
 
-## Overview
+## Snapshot
 
-The Cohere Proxy Server is now a robust, stateless, and scalable service with modern JavaScript best practices, comprehensive error handling, and advanced token management. All recent fixes and improvements have been applied and verified.
+Recent merge delivered the following verified changes:
 
-## Key Improvements
+- ESM refactor: `src/` layout and `package.json` updated to `"type": "module"`.
+- Background indexing: RAG indexing now enqueues jobs and processes them asynchronously.
+- Embedding cache: LRU+TTL cache in `src/utils/lruTtlCache.mjs` to reduce embedding API calls.
+- Semantic retrieval + fallback: embedding-first search with keyword fallback.
+- Conversation manager: session LRU pruning and graceful shutdown hooks.
+- Structured logging & metrics: `pino` + basic `prom-client` counters added.
+- Tests: Vitest unit tests and Supertest-based endpoint tests added and validated locally.
+- Docker/build: `build-dist.mjs`, updated Dockerfile and `docker-compose.yml` to run ESM entrypoint.
 
-- Modular, class-based architecture with focused methods
-- Async initialization: model fetching moved out of constructor and into `start`
-- API compatibility: uses `models.list()` and correct Cohere API methods
-- Comprehensive error handling: specific status codes, error types, and processing time in responses
-- Security: rate limiting, Helmet headers, CORS, API key validation
-- Multi-model support and OpenAI API compatibility
-- Token usage estimation, overflow handling, and request tracking
-- In-memory caching for prompt responses
-- Fallback to default models if Cohere API is unavailable
-- Retrieval-Augmented Generation (RAG): Integrated document retrieval and context injection for enhanced, knowledge-grounded responses
-- Modern JavaScript: deprecated methods replaced, clean destructuring, and best practices throughout
-- Clear, actionable documentation and configuration guides
+## Done / Validated
 
-## Technical Summary
+- Convert repo to ESM: Done
+- Non-blocking indexing (background queue): Done
+- Embedding caching (LRU+TTL): Done
+- RAG semantic fallback: Done
+- Basic observability (pino, prom-client): Done
+- Unit & endpoint tests (Vitest + Supertest): Done (core flows)
 
-- **Architecture:** Stateless, horizontally scalable, Docker-ready
-- **Async Patterns:** No async logic in constructor; all async initialization in `start`
-- **Security:** All configuration via environment variables; no sensitive data in logs
-- **Monitoring:** Health endpoint, structured logging, performance metrics
-- **Testing:** Unit/integration tests, modular design
-- **RAG Integration:** The system now supports retrieval-augmented generation, injecting relevant documents into conversation context for improved, knowledge-grounded responses.
-- **Deployment:** Graceful shutdown, health checks, Docker support
+## Pending / Next PRs
 
-## Configuration
+- Full request schema validation (Zod/AJV) and strict API contracts
+- API auth (API-key middleware) for admin/RAG endpoints
+- Circuit-breaker + robust retry wrapper for Cohere API calls
+- Persistent vector DB adapter + Redis for distributed caching
+- SSE/streaming chat support and large-response streaming
+- Expand tests and CI (coverage reporting)
 
-Environment variables:
-- `COHERE_API_KEY` (required)
-- `PORT` (default: 3000)
-- `ALLOWED_ORIGINS` (default: *)
-- `MAX_TOTAL_TOKENS`, `MIN_COMPLETION_TOKENS`, `MAX_COMPLETION_TOKENS`, `TOKEN_SAFETY_BUFFER`
-- `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX_REQUESTS`
+## How to validate locally (PowerShell)
 
-## Readiness Checklist
+Below are copy/paste-ready PowerShell commands you can run from the repository root (`D:\Code\Temp\cohere-openai-proxy`) to validate common checks. Expected outputs are noted where helpful.
 
-- Security, monitoring, error handling, and documentation complete
-- Stateless and scalable for production deployment
-- All features tested and documented
-- All recent code fixes and improvements verified and documented
+1) Install dependencies (first run / after package changes):
+
+```powershell
+npm install
+```
+
+Expected: completes without errors and writes to `node_modules/`.
+
+2) Run unit + endpoint tests (Vitest):
+
+```powershell
+npm test --silent
+```
+
+Expected: all tests pass; example snippet from a successful run shows `passed` counts and no failing tests.
+
+3) Start dev server (in the foreground) and verify `/health`:
+
+```powershell
+npm run start:dev
+# in a separate shell:
+Invoke-RestMethod -Uri http://localhost:3000/health
+```
+
+Expected: JSON health payload with basic fields like `uptime`, `version`, and `ragIndexSize` (or similar). If port 3000 is in use, the server logs the selected port.
+
+4) Enqueue a quick RAG index job (local test)
+
+```powershell
+# replace <ADMIN_KEY> with your API key if API auth is enabled
+Invoke-RestMethod -Method Post -Uri http://localhost:3000/v1/rag/index -Body (@{path='.'} | ConvertTo-Json) -ContentType 'application/json'
+```
+
+Expected: 200/202 and JSON acknowledging the job (e.g., `{ jobId, status: 'queued' }`). Check server logs for background processing messages.
+
+5) Run a quick chat request against the local server (OpenAI-compatible shape)
+
+```powershell
+$body = @{
+  model = 'command-r'
+  messages = @(@{role='user'; content='Hello, please summarize a small repo.'})
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost:3000/v1/chat/completions -Body $body -ContentType 'application/json'
+```
+
+Expected: JSON response shaped like an OpenAI chat completion. If RAG is enabled and index populated, reply may include RAG-sourced context.
+
+6) Run the specific test file only (fast feedback):
+
+```powershell
+npx vitest run test/endpoints.test.mjs --reporter verbose
+```
+
+Expected: That single test file runs; useful while developing endpoints or middleware.
+
+## Notes
+
+- If you add new dependencies (for follow-up PRs), run `npm install` before running tests.
+- For Docker-based testing, build the image using `docker build -t cohere-proxy .` and run with `docker run -p 3000:3000 --env-file .env cohere-proxy`.
+- If a test fails, run with `npx vitest --run` to get detailed failure traces.
+
+## Notes
+
+- The current PR focused on keeping the change small and reviewable: ESM, embedding cache, and background indexing were grouped together.
+- Follow-up PRs will be scoped to single concerns and include tests for the new behavior.
