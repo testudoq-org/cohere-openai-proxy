@@ -15,6 +15,7 @@ const require = createRequire(import.meta.url);
 import Pino from 'pino';
 import promClient from 'prom-client';
 import { createStartupWatchdog } from './utils/startupWatchdog.mjs';
+import { httpAgent, httpsAgent, applyGlobalAgents } from './utils/httpAgent.mjs';
 
 import LruTtlCache from './utils/lruTtlCache.mjs';
 import RAGDocumentManager from './ragDocumentManager.mjs';
@@ -26,6 +27,14 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const logger = Pino({ level: process.env.LOG_LEVEL || 'info' });
+
+const DIAGNOSTICS_DISABLED = !!(process.env.SKIP_DIAGNOSTICS && ['1', 'true', 'yes'].includes(String(process.env.SKIP_DIAGNOSTICS).toLowerCase()));
+function nowMs() { return Number(process.hrtime.bigint() / 1000000n); }
+function generateTraceId() { return Date.now().toString(36) + Math.random().toString(36).slice(2,10); }
+function diagLog(obj) { if (DIAGNOSTICS_DISABLED) return; try { console.log(JSON.stringify(obj)); } catch (e) {} }
+
+// Best-effort: apply global agents to improve connection reuse
+applyGlobalAgents();
 
 class EnhancedCohereRAGServer {
   constructor({ port = process.env.PORT || 3000 } = {}) {
@@ -166,16 +175,26 @@ class EnhancedCohereRAGServer {
   }
 
   async handleChatCompletion(req, res) {
-    const startTime = Date.now();
+    const startTime = nowMs();
+    const traceId = req.headers['x-trace-id'] || generateTraceId();
     try {
       const { messages, temperature = 0.7, max_tokens, model = 'command-r-plus', sessionId } = req.body;
       if (!Array.isArray(messages) || messages.length === 0) return res.status(400).json({ error: { message: 'Messages array required', type: 'invalid_request_error' } });
+      if (!DIAGNOSTICS_DISABLED) {
+        req._diag = { traceId, t0: startTime };
+        diagLog({ traceId, phase: 'server:received', route: req.path, start: startTime });
+      }
 
       const effectiveSessionId = sessionId || this.generateId();
+      const tAdd = nowMs();
       for (const m of messages) await this.conversationManager.addMessage(effectiveSessionId, m.role, this.extractContentString(m.content));
+      if (!DIAGNOSTICS_DISABLED) diagLog({ traceId, phase: 'server:messages-added', durationMs: nowMs() - tAdd, messageCount: messages.length });
 
+      const convoStart = nowMs();
       const conversationData = this.conversationManager.getFormattedHistoryWithRAG(effectiveSessionId);
-      const response = await this.callCohereChatAPI(model, conversationData, temperature, max_tokens);
+      if (!DIAGNOSTICS_DISABLED) diagLog({ traceId, phase: 'server:conversation-built', durationMs: nowMs() - convoStart, ragCount: (this.conversationManager.conversations.get(effectiveSessionId)?.ragContext || []).length });
+
+      const response = await this.callCohereChatAPI(model, conversationData, temperature, max_tokens, traceId);
       if (!response) return res.status(500).json({ error: { message: 'Failed to receive response from Cohere API', type: 'internal_server_error' } });
 
       const assistantResponse = response.text || '';
@@ -205,9 +224,21 @@ class EnhancedCohereRAGServer {
     if (conversationData.preamble) payload.preamble = conversationData.preamble;
 
     try {
-  const resp = await retry(() => this.cohereCircuit.exec(() => this.cohere.chat(payload)), 3, 200);
-  return resp;
+      const sent = nowMs();
+      if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:call:start', model, payloadSizeChars: String(JSON.stringify(payload).length), start: sent });
+
+      // If Cohere client accepts agent, try to use it (best-effort). Otherwise rely on globalAgent.
+      let callFn = () => this.cohere.chat(payload);
+      if (this.cohere && typeof this.cohere.chat === 'function') {
+        // prefer existing SDK behavior; many SDKs accept an options object but not all — keep best-effort
+        callFn = () => this.cohere.chat(payload);
+      }
+
+      const resp = await retry(() => this.cohereCircuit.exec(callFn), 3, 200);
+      if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:call:end', model, durationMs: nowMs() - sent });
+      return resp;
     } catch (err) {
+      if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:error', model, err: String(err?.message) });
       logger.error({ err }, 'Cohere chat error');
       return null;
     }
