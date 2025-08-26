@@ -19,6 +19,8 @@ import { createStartupWatchdog } from './utils/startupWatchdog.mjs';
 import LruTtlCache from './utils/lruTtlCache.mjs';
 import RAGDocumentManager from './ragDocumentManager.mjs';
 import ConversationManager from './conversationManager.mjs';
+import { retry } from './utils/retry.mjs';
+import { SimpleCircuitBreaker } from './utils/circuitBreaker.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -53,12 +55,15 @@ class EnhancedCohereRAGServer {
     this.metrics = {
       httpRequests: new promClient.Counter({ name: 'http_requests_total', help: 'Total HTTP requests' }),
     };
+  // Circuit breaker for external Cohere API calls
+  this.cohereCircuit = new SimpleCircuitBreaker({ failureThreshold: Number(process.env.COHERE_CB_FAILURES) || 5, resetTimeoutMs: Number(process.env.COHERE_CB_RESET_MS) || 10000 });
   }
 
   async initializeSupportedModels() {
     try {
-      const response = await this.cohere.models.list();
-      this.supportedModels = new Set(response.models.map((m) => m.name));
+      const response = await retry(() => this.cohereCircuit.exec(() => this.cohere.models.list()), 3, 200);
+      const models = response?.models ?? response?.body?.models ?? [];
+      this.supportedModels = new Set(models.map((m) => m.name));
       logger.info({ supportedModels: Array.from(this.supportedModels) }, 'Supported Cohere models');
     } catch (err) {
       logger.warn({ err: err?.message }, 'Failed to list models, using defaults');
@@ -175,8 +180,8 @@ class EnhancedCohereRAGServer {
     if (conversationData.preamble) payload.preamble = conversationData.preamble;
 
     try {
-      const resp = await this.cohere.chat(payload);
-      return resp;
+  const resp = await retry(() => this.cohereCircuit.exec(() => this.cohere.chat(payload)), 3, 200);
+  return resp;
     } catch (err) {
       logger.error({ err }, 'Cohere chat error');
       return null;

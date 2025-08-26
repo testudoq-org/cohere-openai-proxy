@@ -13,6 +13,12 @@ class RAGDocumentManager {
     this.supportedExtensions = new Set(['.js', '.ts', '.py', '.java', '.md', '.json', '.yaml', '.yml', '.html', '.css', '.sql', '.sh']);
     this.indexingQueue = [];
     this.indexing = false;
+  // Embedding batching/queue config (tunable via env)
+  this.embeddingModel = process.env.COHERE_EMBEDDING_MODEL || 'small';
+  this.maxEmbeddingBatch = Number(process.env.MAX_EMBEDDING_BATCH) || 24;
+  this.embeddingQueue = []; // items: { key, text }
+  this.embeddingWorkerRunning = false;
+  this.embeddingWorkerDelayMs = Number(process.env.EMBEDDING_WORKER_DELAY_MS) || 100;
   }
 
   async indexCodebase(projectPath, options = {}) {
@@ -56,14 +62,75 @@ class RAGDocumentManager {
           const metadata = { filePath: fp, language: ext.replace('.', ''), category: this._categorizeFile(fp) };
           this.documents.set(id, { content: c, metadata });
           this._indexByCategory(metadata.category, id);
-          // async get embedding but don't await for each chunk to avoid blocking
-          this.getEmbedding(c).catch((e) => this.logger.warn({ e }, 'Embedding failed (async)'));
+          // enqueue chunk for batched embedding; don't await here
+          this.enqueueEmbedding(id, c);
         }
       } catch (err) {
         this.logger.warn({ err, file: fp }, 'Skipping file');
       }
     }
     return { indexed: files.length };
+  }
+
+  // Enqueue a single text to be embedded by the background worker
+  enqueueEmbedding(key, text) {
+    try {
+      this.embeddingQueue.push({ key, text });
+      if (!this.embeddingWorkerRunning) {
+        // start worker but don't await - it will run asynchronously
+        this._processEmbeddingQueue().catch((e) => this.logger.warn({ e }, 'Embedding worker crashed'));
+      }
+    } catch (e) {
+      this.logger.warn({ e }, 'Failed to enqueue embedding');
+    }
+  }
+
+  async _processEmbeddingQueue() {
+    if (this.embeddingWorkerRunning) return;
+    this.embeddingWorkerRunning = true;
+    while (this.embeddingQueue.length > 0) {
+      const batch = this.embeddingQueue.splice(0, this.maxEmbeddingBatch);
+      const texts = batch.map(b => b.text);
+      try {
+        const resp = await this._callEmbedApi(texts);
+        const embeddings = resp?.body?.embeddings ?? resp?.embeddings ?? resp;
+        if (!Array.isArray(embeddings) || embeddings.length !== texts.length) {
+          this.logger.warn({ received: Array.isArray(embeddings) ? embeddings.length : typeof embeddings }, 'Unexpected embedding response shape');
+        } else {
+          for (let i = 0; i < batch.length; i++) {
+            this.embeddingCache.set(batch[i].key, embeddings[i]);
+          }
+        }
+      } catch (err) {
+        this.logger.warn({ err }, 'Batch embedding failed — requeueing items with delay');
+        // simple requeue with delay to avoid tight failure loops
+        this.embeddingQueue.unshift(...batch);
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      // polite throttle between batches
+      await new Promise(r => setTimeout(r, this.embeddingWorkerDelayMs));
+    }
+    this.embeddingWorkerRunning = false;
+  }
+
+  // Centralized call to Cohere embed API with simple retries and robust response parsing
+  async _callEmbedApi(texts, attempts = 3) {
+    let lastErr;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        const payload = { model: this.embeddingModel, texts };
+        const resp = await this.cohere.embed(payload);
+        const embeddings = resp?.body?.embeddings ?? resp?.embeddings ?? resp;
+        if (!embeddings) throw new Error('No embeddings in response');
+        return { body: { embeddings } };
+      } catch (err) {
+        lastErr = err;
+        const backoff = 100 * Math.pow(2, attempt - 1);
+        this.logger.warn({ err, attempt }, 'Embedding API call failed; retrying after backoff');
+        await new Promise(r => setTimeout(r, backoff));
+      }
+    }
+    throw lastErr;
   }
 
   async retrieveRelevantDocuments(query, options = {}) {
@@ -110,17 +177,17 @@ class RAGDocumentManager {
   }
 
   async getEmbedding(text) {
+    // Backwards compatible single-call helper: will try immediate call on cache miss
     const key = crypto.createHash('md5').update(text).digest('hex');
     const cached = this.embeddingCache.get(key);
     if (cached) return cached;
     try {
-      // call cohere embeddings - use batching/resilience at caller level
-      const resp = await this.cohere.embed({ model: 'small', texts: [text] });
-      const emb = resp.body?.embeddings?.[0] || resp[0] || null;
+      const resp = await this._callEmbedApi([text]);
+      const emb = resp.body?.embeddings?.[0] ?? null;
       if (emb) this.embeddingCache.set(key, emb);
       return emb;
     } catch (err) {
-      this.logger.warn({ err }, 'Embedding API failed');
+      this.logger.warn({ err }, 'Embedding API failed (single call fallback)');
       return null;
     }
   }
