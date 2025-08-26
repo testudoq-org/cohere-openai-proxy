@@ -39,6 +39,9 @@ class RAGDocumentManager {
   this.persistEmbSegmentAgeMs = Number(process.env.RAG_EMB_SEGMENT_AGE_MS) || 24 * 60 * 60 * 1000; // 24h
   this._currentSegment = null; // { path, createdAt, size }
   this._segmentsManifestPath = path.join(this.persistEmbeddingsDir, 'segments.json');
+  // retention/compaction
+  this.persistEmbRetentionCount = Number(process.env.RAG_EMB_RETENTION_COUNT) || 10; // keep up to N segments
+  this._manifestLockPath = path.join(this.persistEmbeddingsDir, 'segments.lock');
   // load persisted index and embeddings asynchronously
   this._loadIndex().catch((e) => this.logger.info({ e }, 'No persisted RAG index loaded'));
   if (this.persistEmbeddings) this._loadEmbeddings().catch((e) => this.logger.info({ e }, 'No persisted RAG embeddings loaded'));
@@ -321,18 +324,67 @@ class RAGDocumentManager {
   async _appendToManifest(entry) {
     try {
       await this._ensureEmbeddingsDir();
-      let manifest = { segments: [] };
+      // acquire lightweight manifest lock to serialize updates
+      await this._acquireManifestLock();
       try {
-        const raw = await fs.readFile(this._segmentsManifestPath, 'utf8');
-        manifest = JSON.parse(raw);
-      } catch (e) { /* no manifest yet */ }
-      manifest.segments = manifest.segments || [];
-      manifest.segments.push(entry);
-      const tmp = `${this._segmentsManifestPath}.tmp`;
-      await fs.writeFile(tmp, JSON.stringify(manifest), 'utf8');
-      await fs.rename(tmp, this._segmentsManifestPath);
+        let manifest = { segments: [] };
+        try {
+          const raw = await fs.readFile(this._segmentsManifestPath, 'utf8');
+          manifest = JSON.parse(raw);
+        } catch (e) { /* no manifest yet or unreadable */ }
+        manifest.segments = manifest.segments || [];
+        manifest.segments.push(entry);
+        // compact/retain only the most recent N entries
+        manifest = this._compactManifestIfNeeded(manifest);
+        const tmp = `${this._segmentsManifestPath}.tmp`;
+        await fs.writeFile(tmp, JSON.stringify(manifest), 'utf8');
+        await fs.rename(tmp, this._segmentsManifestPath);
+      } finally {
+        await this._releaseManifestLock();
+      }
     } catch (e) {
       this.logger.warn({ e }, 'Failed to update segments manifest');
+    }
+  }
+
+  async _acquireManifestLock(retries = 5, delayMs = 50) {
+    // simple lockfile with retry — good enough for single-process atomicity and tests
+    for (let i = 0; i < retries; i++) {
+      try {
+        await fs.writeFile(this._manifestLockPath, String(process.pid), { flag: 'wx' });
+        return;
+      } catch (e) {
+        // already locked
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+    // last attempt: try to remove a stale lock if it points to non-existent pid (best-effort)
+    try {
+      const raw = await fs.readFile(this._manifestLockPath, 'utf8');
+      // don't try to kill or check pid on all platforms; just remove stale lock
+      await fs.unlink(this._manifestLockPath);
+    } catch (e) { /* ignore */ }
+    // final attempt
+    try { await fs.writeFile(this._manifestLockPath, String(process.pid), { flag: 'wx' }); } catch (e) { /* ignore */ }
+  }
+
+  async _releaseManifestLock() {
+    try { await fs.unlink(this._manifestLockPath); } catch (e) { /* ignore */ }
+  }
+
+  _compactManifestIfNeeded(manifest) {
+    try {
+      manifest.segments = manifest.segments || [];
+      if (manifest.segments.length <= this.persistEmbRetentionCount) return manifest;
+      // keep the most recent N segments by createdAt (assume appended in time order)
+      const sorted = manifest.segments.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      const kept = sorted.slice(0, this.persistEmbRetentionCount);
+      // preserve original order of kept files (oldest first)
+      kept.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+      manifest.segments = kept;
+      return manifest;
+    } catch (e) {
+      return manifest;
     }
   }
 
