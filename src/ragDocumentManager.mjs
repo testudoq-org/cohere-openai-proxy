@@ -1,4 +1,7 @@
 import fs from 'fs/promises';
+import fsSync from 'fs';
+import readline from 'readline';
+import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import LruTtlCache from './utils/lruTtlCache.mjs';
@@ -26,10 +29,14 @@ class RAGDocumentManager {
       embeddingBatchesProcessed: 0,
       embeddingRequests: 0,
     };
-    // Persistence
-    this.persistPath = process.env.RAG_PERSIST_PATH || path.join(process.cwd(), '.rag_index.json');
-    // load persisted index asynchronously
-    this._loadIndex().catch((e) => this.logger.info({ e }, 'No persisted RAG index loaded'));
+  // Persistence for index
+  this.persistPath = process.env.RAG_PERSIST_PATH || path.join(process.cwd(), '.rag_index.json');
+  // Embedding persistence (ndjson) to avoid large JSON memory spikes
+  this.persistEmbeddings = process.env.RAG_PERSIST_EMBEDDINGS === '1' || process.env.RAG_PERSIST_EMBEDDINGS === 'true';
+  this.persistEmbeddingsPath = process.env.RAG_EMBEDDINGS_PATH || path.join(process.cwd(), '.rag_embeddings.ndjson');
+  // load persisted index and embeddings asynchronously
+  this._loadIndex().catch((e) => this.logger.info({ e }, 'No persisted RAG index loaded'));
+  if (this.persistEmbeddings) this._loadEmbeddings().catch((e) => this.logger.info({ e }, 'No persisted RAG embeddings loaded'));
   }
 
   async indexCodebase(projectPath, options = {}) {
@@ -116,6 +123,15 @@ class RAGDocumentManager {
         } else {
           for (let i = 0; i < batch.length; i++) {
             this.embeddingCache.set(batch[i].key, embeddings[i]);
+            // persist embedding line
+            if (this.persistEmbeddings) {
+              try {
+                const line = JSON.stringify({ key: batch[i].key, embedding: embeddings[i] }) + os.EOL;
+                await fs.appendFile(this.persistEmbeddingsPath, line, 'utf8');
+              } catch (e) {
+                this.logger.warn({ e }, 'Failed to persist embedding line');
+              }
+            }
           }
           this.metrics.embeddingBatchesProcessed += 1;
           // persist index periodically to capture newly embedded docs
@@ -174,6 +190,18 @@ class RAGDocumentManager {
       if (snap?.documentIndex) this.documentIndex = new Map(snap.documentIndex.map(([k, arr]) => [k, new Set(arr)]));
     } catch (e) {
       // no persisted index is acceptable
+    }
+  }
+
+  async _loadEmbeddings() {
+    if (!fsSync.existsSync(this.persistEmbeddingsPath)) return;
+    const rl = readline.createInterface({ input: fsSync.createReadStream(this.persistEmbeddingsPath), crlfDelay: Infinity });
+    for await (const line of rl) {
+      if (!line || !line.trim()) continue;
+      try {
+        const item = JSON.parse(line);
+        if (item?.key && item?.embedding) this.embeddingCache.set(item.key, item.embedding);
+      } catch (e) { /* ignore malformed lines */ }
     }
   }
 
@@ -277,7 +305,12 @@ class RAGDocumentManager {
   }
 
   getStats() {
-    return { docs: this.documents.size, embeddingCache: this.embeddingCache.map?.size ?? undefined };
+    return {
+      docs: this.documents.size,
+      embeddingCache: this.embeddingCache.map?.size ?? undefined,
+      metrics: this.metrics,
+      persistEmbeddings: this.persistEmbeddings || false,
+    };
   }
 
   clearIndex() { this.documents.clear(); this.documentIndex.clear(); this.embeddingCache.clear(); }
