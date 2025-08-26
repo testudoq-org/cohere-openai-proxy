@@ -55,6 +55,13 @@ class EnhancedCohereRAGServer {
     this.metrics = {
       httpRequests: new promClient.Counter({ name: 'http_requests_total', help: 'Total HTTP requests' }),
     };
+    // Prometheus gauges for RAG embedding metrics
+    this.promMetrics = {
+      embeddingQueueLength: new promClient.Gauge({ name: 'rag_embedding_queue_length', help: 'Embedding queue length' }),
+      embeddingFailures: new promClient.Gauge({ name: 'rag_embedding_failures', help: 'Embedding failures count' }),
+      embeddingBatchesProcessed: new promClient.Gauge({ name: 'rag_embedding_batches_processed', help: 'Embedding batches processed' }),
+      embeddingRequests: new promClient.Gauge({ name: 'rag_embedding_requests', help: 'Embedding requests made' }),
+    };
   // Circuit breaker for external Cohere API calls
   this.cohereCircuit = new SimpleCircuitBreaker({ failureThreshold: Number(process.env.COHERE_CB_FAILURES) || 5, resetTimeoutMs: Number(process.env.COHERE_CB_RESET_MS) || 10000 });
   }
@@ -89,6 +96,24 @@ class EnhancedCohereRAGServer {
       const conversationStats = this.conversationManager.getStats();
       const ragStats = this.ragManager.getStats();
       res.json({ status: 'healthy', uptime: process.uptime(), conversation_stats: conversationStats, rag_stats: ragStats });
+    });
+
+    // Prometheus metrics endpoint - update gauges from ragManager and return registry
+    this.app.get('/metrics', async (req, res) => {
+      try {
+        const ragStats = this.ragManager.getStats();
+        const m = ragStats?.metrics || {};
+        this.promMetrics.embeddingQueueLength.set(Number(m.embeddingQueueLength || 0));
+        this.promMetrics.embeddingFailures.set(Number(m.embeddingFailures || 0));
+        this.promMetrics.embeddingBatchesProcessed.set(Number(m.embeddingBatchesProcessed || 0));
+        this.promMetrics.embeddingRequests.set(Number(m.embeddingRequests || 0));
+
+        res.setHeader('Content-Type', promClient.register.contentType);
+        res.send(await promClient.register.metrics());
+      } catch (err) {
+        logger.error({ err }, 'Failed to scrape metrics');
+        res.status(500).send('error');
+      }
     });
 
     this.app.post('/v1/chat/completions', this.handleChatCompletion.bind(this));
