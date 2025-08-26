@@ -1,4 +1,8 @@
 import fs from 'fs/promises';
+import fsSync from 'fs';
+import readline from 'readline';
+import os from 'os';
+import zlib from 'zlib';
 import path from 'path';
 import crypto from 'crypto';
 import LruTtlCache from './utils/lruTtlCache.mjs';
@@ -13,6 +17,34 @@ class RAGDocumentManager {
     this.supportedExtensions = new Set(['.js', '.ts', '.py', '.java', '.md', '.json', '.yaml', '.yml', '.html', '.css', '.sql', '.sh']);
     this.indexingQueue = [];
     this.indexing = false;
+  // Embedding batching/queue config (tunable via env)
+  this.embeddingModel = process.env.COHERE_EMBEDDING_MODEL || 'small';
+  this.maxEmbeddingBatch = Number(process.env.MAX_EMBEDDING_BATCH) || 24;
+  this.embeddingQueue = []; // items: { key, text }
+  this.embeddingWorkerRunning = false;
+  this.embeddingWorkerDelayMs = Number(process.env.EMBEDDING_WORKER_DELAY_MS) || 100;
+    // Metrics
+    this.metrics = {
+      embeddingQueueLength: 0,
+      embeddingFailures: 0,
+      embeddingBatchesProcessed: 0,
+      embeddingRequests: 0,
+    };
+  // Persistence for index
+  this.persistPath = process.env.RAG_PERSIST_PATH || path.join(process.cwd(), '.rag_index.json');
+  // Embedding persistence (segmented ndjson) to avoid large JSON memory spikes
+  this.persistEmbeddings = process.env.RAG_PERSIST_EMBEDDINGS === '1' || process.env.RAG_PERSIST_EMBEDDINGS === 'true';
+  this.persistEmbeddingsDir = process.env.RAG_EMBEDDINGS_DIR || path.join(process.cwd(), '.rag_embeddings');
+  this.persistEmbSegmentSizeMB = Number(process.env.RAG_EMB_SEGMENT_SIZE_MB) || 5; // MB
+  this.persistEmbSegmentAgeMs = Number(process.env.RAG_EMB_SEGMENT_AGE_MS) || 24 * 60 * 60 * 1000; // 24h
+  this._currentSegment = null; // { path, createdAt, size }
+  this._segmentsManifestPath = path.join(this.persistEmbeddingsDir, 'segments.json');
+  // retention/compaction
+  this.persistEmbRetentionCount = Number(process.env.RAG_EMB_RETENTION_COUNT) || 10; // keep up to N segments
+  this._manifestLockPath = path.join(this.persistEmbeddingsDir, 'segments.lock');
+  // load persisted index and embeddings asynchronously
+  this._loadIndex().catch((e) => this.logger.info({ e }, 'No persisted RAG index loaded'));
+  if (this.persistEmbeddings) this._loadEmbeddings().catch((e) => this.logger.info({ e }, 'No persisted RAG embeddings loaded'));
   }
 
   async indexCodebase(projectPath, options = {}) {
@@ -56,14 +88,304 @@ class RAGDocumentManager {
           const metadata = { filePath: fp, language: ext.replace('.', ''), category: this._categorizeFile(fp) };
           this.documents.set(id, { content: c, metadata });
           this._indexByCategory(metadata.category, id);
-          // async get embedding but don't await for each chunk to avoid blocking
-          this.getEmbedding(c).catch((e) => this.logger.warn({ e }, 'Embedding failed (async)'));
+          // enqueue chunk for batched embedding; don't await here
+          this.enqueueEmbedding(id, c);
         }
       } catch (err) {
         this.logger.warn({ err, file: fp }, 'Skipping file');
       }
     }
-    return { indexed: files.length };
+  // persist index after indexing job completes
+  try { await this._saveIndex(); } catch (e) { this.logger.warn({ e }, 'Failed to save index after _doIndex'); }
+  return { indexed: files.length };
+  }
+
+  // Enqueue a single text to be embedded by the background worker
+  enqueueEmbedding(key, text) {
+    try {
+  this.embeddingQueue.push({ key, text });
+  this.metrics.embeddingQueueLength = this.embeddingQueue.length;
+      if (!this.embeddingWorkerRunning) {
+        // start worker but don't await - it will run asynchronously
+        this._processEmbeddingQueue().catch((e) => this.logger.warn({ e }, 'Embedding worker crashed'));
+      }
+    } catch (e) {
+      this.logger.warn({ e }, 'Failed to enqueue embedding');
+    }
+  }
+
+  async _processEmbeddingQueue() {
+    if (this.embeddingWorkerRunning) return;
+    this.embeddingWorkerRunning = true;
+    while (this.embeddingQueue.length > 0) {
+      const batch = this.embeddingQueue.splice(0, this.maxEmbeddingBatch);
+      this.metrics.embeddingQueueLength = this.embeddingQueue.length;
+      const texts = batch.map(b => b.text);
+      try {
+        this.metrics.embeddingRequests += 1;
+        const resp = await this._callEmbedApi(texts);
+        const embeddings = resp?.body?.embeddings ?? resp?.embeddings ?? resp;
+        if (!Array.isArray(embeddings) || embeddings.length !== texts.length) {
+          this.logger.warn({ received: Array.isArray(embeddings) ? embeddings.length : typeof embeddings }, 'Unexpected embedding response shape');
+          this.metrics.embeddingFailures += 1;
+        } else {
+          for (let i = 0; i < batch.length; i++) {
+            this.embeddingCache.set(batch[i].key, embeddings[i]);
+            // persist embedding line using segmented files
+            if (this.persistEmbeddings) {
+              try {
+                await this._appendToSegment(JSON.stringify({ key: batch[i].key, embedding: embeddings[i] }) + os.EOL);
+              } catch (e) {
+                this.logger.warn({ e }, 'Failed to persist embedding line');
+              }
+            }
+          }
+          this.metrics.embeddingBatchesProcessed += 1;
+          // persist index periodically to capture newly embedded docs
+          try { await this._saveIndex(); } catch (e) { this.logger.warn({ e }, 'Failed to save index after embedding batch'); }
+        }
+      } catch (err) {
+        this.logger.warn({ err }, 'Batch embedding failed — requeueing items with delay');
+        this.metrics.embeddingFailures += 1;
+        // simple requeue with delay to avoid tight failure loops
+        this.embeddingQueue.unshift(...batch);
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      // polite throttle between batches
+      await new Promise(r => setTimeout(r, this.embeddingWorkerDelayMs));
+    }
+    this.embeddingWorkerRunning = false;
+  }
+
+  // Centralized call to Cohere embed API with simple retries and robust response parsing
+  async _callEmbedApi(texts, attempts = 3) {
+    let lastErr;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        const payload = { model: this.embeddingModel, texts };
+        const resp = await this.cohere.embed(payload);
+        const embeddings = resp?.body?.embeddings ?? resp?.embeddings ?? resp;
+        if (!embeddings) throw new Error('No embeddings in response');
+        return { body: { embeddings } };
+      } catch (err) {
+        lastErr = err;
+        const backoff = 100 * Math.pow(2, attempt - 1);
+        this.logger.warn({ err, attempt }, 'Embedding API call failed; retrying after backoff');
+        await new Promise(r => setTimeout(r, backoff));
+      }
+    }
+    throw lastErr;
+  }
+
+  async _saveIndex() {
+    try {
+      const snapshot = {
+        documents: Array.from(this.documents.entries()),
+        documentIndex: Array.from(this.documentIndex.entries()).map(([k, s]) => [k, Array.from(s)]),
+      };
+      await fs.writeFile(this.persistPath, JSON.stringify(snapshot), 'utf8');
+    } catch (e) {
+      this.logger.warn({ e }, 'Failed to persist RAG index');
+    }
+  }
+
+  async _loadIndex() {
+    try {
+      const raw = await fs.readFile(this.persistPath, 'utf8');
+      const snap = JSON.parse(raw);
+      if (snap?.documents) this.documents = new Map(snap.documents);
+      if (snap?.documentIndex) this.documentIndex = new Map(snap.documentIndex.map(([k, arr]) => [k, new Set(arr)]));
+    } catch (e) {
+      // no persisted index is acceptable
+    }
+  }
+
+  async _loadEmbeddings() {
+    // read all segment files (plain .ndjson or .ndjson.gz)
+    await this._ensureEmbeddingsDir();
+    // prefer reading manifest if present to get deterministic order
+    let files = [];
+    try {
+      const raw = await fs.readFile(this._segmentsManifestPath, 'utf8');
+      const manifest = JSON.parse(raw);
+      const manifestFiles = (manifest.segments || []).map(s => (path.basename(s.file || '')).trim()).filter(Boolean);
+      // also include any remaining .ndjson files that haven't been rotated yet
+      const dirFiles = (await fs.readdir(this.persistEmbeddingsDir)).filter(f => !f.endsWith('.tmp') && f !== path.basename(this._segmentsManifestPath));
+      const extras = dirFiles.filter(f => f.endsWith('.ndjson') && !manifestFiles.includes(f));
+      files = Array.from(new Set([...manifestFiles, ...extras]));
+      // if manifest exists but has no entries, fallback to directory listing
+      if (!files || files.length === 0) {
+        files = dirFiles;
+        files.sort();
+      }
+    } catch (e) {
+      // fallback: read directory (ignore tmp files and manifest)
+      files = (await fs.readdir(this.persistEmbeddingsDir)).filter(f => !f.endsWith('.tmp') && f !== path.basename(this._segmentsManifestPath));
+      files.sort();
+    }
+    for (const f of files) {
+      const safeName = String(f || '').trim();
+      if (!safeName) continue;
+      const full = path.join(this.persistEmbeddingsDir, safeName);
+      // skip files that no longer exist (race with rotation)
+      if (!fsSync.existsSync(full)) continue;
+      try {
+        if (safeName.endsWith('.gz')) {
+          const stream = fsSync.createReadStream(full).pipe(zlib.createGunzip());
+          const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+          for await (const line of rl) {
+            if (!line || !line.trim()) continue;
+            try {
+              const item = JSON.parse(line);
+              if (item?.key && item?.embedding) this.embeddingCache.set(item.key, item.embedding);
+            } catch (e) { /* ignore malformed lines */ }
+          }
+        } else if (safeName.endsWith('.ndjson')) {
+          const rl = readline.createInterface({ input: fsSync.createReadStream(full), crlfDelay: Infinity });
+          for await (const line of rl) {
+            if (!line || !line.trim()) continue;
+            try {
+              const item = JSON.parse(line);
+              if (item?.key && item?.embedding) this.embeddingCache.set(item.key, item.embedding);
+            } catch (e) { /* ignore malformed lines */ }
+          }
+        }
+      } catch (err) {
+        // ignore file read errors (race with rotation or partial writes)
+        this.logger.warn({ err, file: full }, 'Skipping segment due to read error');
+        continue;
+      }
+    }
+  }
+
+  async _ensureEmbeddingsDir() {
+    try {
+      await fs.mkdir(this.persistEmbeddingsDir, { recursive: true });
+      // recompute manifest path in case persistEmbeddingsDir was changed after construction
+      this._segmentsManifestPath = path.join(this.persistEmbeddingsDir, 'segments.json');
+    } catch (e) { }
+  }
+
+  async _openNewSegment() {
+    await this._ensureEmbeddingsDir();
+    const name = `segment-${Date.now()}.ndjson`;
+    const full = path.join(this.persistEmbeddingsDir, name);
+    this._currentSegment = { path: full, createdAt: Date.now(), size: 0 };
+    // ensure file exists
+    await fs.writeFile(full, '', 'utf8');
+    // ensure manifest exists
+    try {
+      if (!fsSync.existsSync(this._segmentsManifestPath)) {
+        await fs.writeFile(this._segmentsManifestPath, JSON.stringify({ segments: [] }), 'utf8');
+      }
+    } catch (e) { /* ignore */ }
+    return this._currentSegment;
+  }
+
+  async _appendToSegment(line) {
+    if (!this._currentSegment) await this._openNewSegment();
+    await fs.appendFile(this._currentSegment.path, line, 'utf8');
+    this._currentSegment.size += Buffer.byteLength(line, 'utf8');
+    const sizeMB = this._currentSegment.size / (1024 * 1024);
+    const age = Date.now() - this._currentSegment.createdAt;
+    if (sizeMB >= this.persistEmbSegmentSizeMB || age >= this.persistEmbSegmentAgeMs) {
+      // rotate: gzip current and start new
+      await this._rotateSegment(this._currentSegment.path);
+      this._currentSegment = null;
+    }
+  }
+
+  async _rotateSegment(filePath) {
+    try {
+      const gzPath = `${filePath}.gz`;
+      // write to a temp gz first, then rename for atomicity
+      const tmpGz = `${gzPath}.tmp`;
+      await new Promise((resolve, reject) => {
+        const rs = fsSync.createReadStream(filePath);
+        const ws = fsSync.createWriteStream(tmpGz);
+        const gzip = zlib.createGzip();
+        rs.pipe(gzip).pipe(ws).on('finish', resolve).on('error', reject);
+      });
+      // rename temp to final
+      await fs.rename(tmpGz, gzPath);
+      // remove original
+      await fs.unlink(filePath);
+      // update manifest atomically
+      try {
+        const stat = await fs.stat(gzPath);
+        const entry = { file: path.basename(gzPath), size: stat.size, createdAt: Date.now() };
+        await this._appendToManifest(entry);
+      } catch (e) { /* ignore manifest update failure */ }
+    } catch (e) {
+      this.logger.warn({ e }, 'Failed to rotate embedding segment');
+    }
+  }
+
+  async _appendToManifest(entry) {
+    try {
+      await this._ensureEmbeddingsDir();
+      // acquire lightweight manifest lock to serialize updates
+      await this._acquireManifestLock();
+      try {
+        let manifest = { segments: [] };
+        try {
+          const raw = await fs.readFile(this._segmentsManifestPath, 'utf8');
+          manifest = JSON.parse(raw);
+        } catch (e) { /* no manifest yet or unreadable */ }
+        manifest.segments = manifest.segments || [];
+        manifest.segments.push(entry);
+        // compact/retain only the most recent N entries
+        manifest = this._compactManifestIfNeeded(manifest);
+        const tmp = `${this._segmentsManifestPath}.tmp`;
+        await fs.writeFile(tmp, JSON.stringify(manifest), 'utf8');
+        await fs.rename(tmp, this._segmentsManifestPath);
+      } finally {
+        await this._releaseManifestLock();
+      }
+    } catch (e) {
+      this.logger.warn({ e }, 'Failed to update segments manifest');
+    }
+  }
+
+  async _acquireManifestLock(retries = 5, delayMs = 50) {
+    // simple lockfile with retry — good enough for single-process atomicity and tests
+    for (let i = 0; i < retries; i++) {
+      try {
+        await fs.writeFile(this._manifestLockPath, String(process.pid), { flag: 'wx' });
+        return;
+      } catch (e) {
+        // already locked
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+    // last attempt: try to remove a stale lock if it points to non-existent pid (best-effort)
+    try {
+      const raw = await fs.readFile(this._manifestLockPath, 'utf8');
+      // don't try to kill or check pid on all platforms; just remove stale lock
+      await fs.unlink(this._manifestLockPath);
+    } catch (e) { /* ignore */ }
+    // final attempt
+    try { await fs.writeFile(this._manifestLockPath, String(process.pid), { flag: 'wx' }); } catch (e) { /* ignore */ }
+  }
+
+  async _releaseManifestLock() {
+    try { await fs.unlink(this._manifestLockPath); } catch (e) { /* ignore */ }
+  }
+
+  _compactManifestIfNeeded(manifest) {
+    try {
+      manifest.segments = manifest.segments || [];
+      if (manifest.segments.length <= this.persistEmbRetentionCount) return manifest;
+      // keep the most recent N segments by createdAt (assume appended in time order)
+      const sorted = manifest.segments.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      const kept = sorted.slice(0, this.persistEmbRetentionCount);
+      // preserve original order of kept files (oldest first)
+      kept.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+      manifest.segments = kept;
+      return manifest;
+    } catch (e) {
+      return manifest;
+    }
   }
 
   async retrieveRelevantDocuments(query, options = {}) {
@@ -110,17 +432,17 @@ class RAGDocumentManager {
   }
 
   async getEmbedding(text) {
+    // Backwards compatible single-call helper: will try immediate call on cache miss
     const key = crypto.createHash('md5').update(text).digest('hex');
     const cached = this.embeddingCache.get(key);
     if (cached) return cached;
     try {
-      // call cohere embeddings - use batching/resilience at caller level
-      const resp = await this.cohere.embed({ model: 'small', texts: [text] });
-      const emb = resp.body?.embeddings?.[0] || resp[0] || null;
+      const resp = await this._callEmbedApi([text]);
+      const emb = resp.body?.embeddings?.[0] ?? null;
       if (emb) this.embeddingCache.set(key, emb);
       return emb;
     } catch (err) {
-      this.logger.warn({ err }, 'Embedding API failed');
+      this.logger.warn({ err }, 'Embedding API failed (single call fallback)');
       return null;
     }
   }
@@ -166,12 +488,19 @@ class RAGDocumentManager {
   }
 
   getStats() {
-    return { docs: this.documents.size, embeddingCache: this.embeddingCache.map?.size ?? undefined };
+    return {
+      docs: this.documents.size,
+      embeddingCache: this.embeddingCache.map?.size ?? undefined,
+      metrics: this.metrics,
+      persistEmbeddings: this.persistEmbeddings || false,
+    };
   }
 
   clearIndex() { this.documents.clear(); this.documentIndex.clear(); this.embeddingCache.clear(); }
 
-  async shutdown() { /* nothing heavy for now */ }
+  async shutdown() { 
+    try { await this._saveIndex(); } catch (e) { this.logger.warn({ e }, 'Failed to save index on shutdown'); }
+  }
 }
 
 export default RAGDocumentManager;
