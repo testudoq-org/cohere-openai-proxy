@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import fsSync from 'fs';
 import readline from 'readline';
 import os from 'os';
+import zlib from 'zlib';
 import path from 'path';
 import crypto from 'crypto';
 import LruTtlCache from './utils/lruTtlCache.mjs';
@@ -31,9 +32,13 @@ class RAGDocumentManager {
     };
   // Persistence for index
   this.persistPath = process.env.RAG_PERSIST_PATH || path.join(process.cwd(), '.rag_index.json');
-  // Embedding persistence (ndjson) to avoid large JSON memory spikes
+  // Embedding persistence (segmented ndjson) to avoid large JSON memory spikes
   this.persistEmbeddings = process.env.RAG_PERSIST_EMBEDDINGS === '1' || process.env.RAG_PERSIST_EMBEDDINGS === 'true';
-  this.persistEmbeddingsPath = process.env.RAG_EMBEDDINGS_PATH || path.join(process.cwd(), '.rag_embeddings.ndjson');
+  this.persistEmbeddingsDir = process.env.RAG_EMBEDDINGS_DIR || path.join(process.cwd(), '.rag_embeddings');
+  this.persistEmbSegmentSizeMB = Number(process.env.RAG_EMB_SEGMENT_SIZE_MB) || 5; // MB
+  this.persistEmbSegmentAgeMs = Number(process.env.RAG_EMB_SEGMENT_AGE_MS) || 24 * 60 * 60 * 1000; // 24h
+  this._currentSegment = null; // { path, createdAt, size }
+  this._segmentsManifestPath = path.join(this.persistEmbeddingsDir, 'segments.json');
   // load persisted index and embeddings asynchronously
   this._loadIndex().catch((e) => this.logger.info({ e }, 'No persisted RAG index loaded'));
   if (this.persistEmbeddings) this._loadEmbeddings().catch((e) => this.logger.info({ e }, 'No persisted RAG embeddings loaded'));
@@ -123,11 +128,10 @@ class RAGDocumentManager {
         } else {
           for (let i = 0; i < batch.length; i++) {
             this.embeddingCache.set(batch[i].key, embeddings[i]);
-            // persist embedding line
+            // persist embedding line using segmented files
             if (this.persistEmbeddings) {
               try {
-                const line = JSON.stringify({ key: batch[i].key, embedding: embeddings[i] }) + os.EOL;
-                await fs.appendFile(this.persistEmbeddingsPath, line, 'utf8');
+                await this._appendToSegment(JSON.stringify({ key: batch[i].key, embedding: embeddings[i] }) + os.EOL);
               } catch (e) {
                 this.logger.warn({ e }, 'Failed to persist embedding line');
               }
@@ -194,14 +198,141 @@ class RAGDocumentManager {
   }
 
   async _loadEmbeddings() {
-    if (!fsSync.existsSync(this.persistEmbeddingsPath)) return;
-    const rl = readline.createInterface({ input: fsSync.createReadStream(this.persistEmbeddingsPath), crlfDelay: Infinity });
-    for await (const line of rl) {
-      if (!line || !line.trim()) continue;
+    // read all segment files (plain .ndjson or .ndjson.gz)
+    await this._ensureEmbeddingsDir();
+    // prefer reading manifest if present to get deterministic order
+    let files = [];
+    try {
+      const raw = await fs.readFile(this._segmentsManifestPath, 'utf8');
+      const manifest = JSON.parse(raw);
+      const manifestFiles = (manifest.segments || []).map(s => (path.basename(s.file || '')).trim()).filter(Boolean);
+      // also include any remaining .ndjson files that haven't been rotated yet
+      const dirFiles = (await fs.readdir(this.persistEmbeddingsDir)).filter(f => !f.endsWith('.tmp') && f !== path.basename(this._segmentsManifestPath));
+      const extras = dirFiles.filter(f => f.endsWith('.ndjson') && !manifestFiles.includes(f));
+      files = Array.from(new Set([...manifestFiles, ...extras]));
+      // if manifest exists but has no entries, fallback to directory listing
+      if (!files || files.length === 0) {
+        files = dirFiles;
+        files.sort();
+      }
+    } catch (e) {
+      // fallback: read directory (ignore tmp files and manifest)
+      files = (await fs.readdir(this.persistEmbeddingsDir)).filter(f => !f.endsWith('.tmp') && f !== path.basename(this._segmentsManifestPath));
+      files.sort();
+    }
+    for (const f of files) {
+      const safeName = String(f || '').trim();
+      if (!safeName) continue;
+      const full = path.join(this.persistEmbeddingsDir, safeName);
+      // skip files that no longer exist (race with rotation)
+      if (!fsSync.existsSync(full)) continue;
       try {
-        const item = JSON.parse(line);
-        if (item?.key && item?.embedding) this.embeddingCache.set(item.key, item.embedding);
-      } catch (e) { /* ignore malformed lines */ }
+        if (safeName.endsWith('.gz')) {
+          const stream = fsSync.createReadStream(full).pipe(zlib.createGunzip());
+          const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+          for await (const line of rl) {
+            if (!line || !line.trim()) continue;
+            try {
+              const item = JSON.parse(line);
+              if (item?.key && item?.embedding) this.embeddingCache.set(item.key, item.embedding);
+            } catch (e) { /* ignore malformed lines */ }
+          }
+        } else if (safeName.endsWith('.ndjson')) {
+          const rl = readline.createInterface({ input: fsSync.createReadStream(full), crlfDelay: Infinity });
+          for await (const line of rl) {
+            if (!line || !line.trim()) continue;
+            try {
+              const item = JSON.parse(line);
+              if (item?.key && item?.embedding) this.embeddingCache.set(item.key, item.embedding);
+            } catch (e) { /* ignore malformed lines */ }
+          }
+        }
+      } catch (err) {
+        // ignore file read errors (race with rotation or partial writes)
+        this.logger.warn({ err, file: full }, 'Skipping segment due to read error');
+        continue;
+      }
+    }
+  }
+
+  async _ensureEmbeddingsDir() {
+    try {
+      await fs.mkdir(this.persistEmbeddingsDir, { recursive: true });
+      // recompute manifest path in case persistEmbeddingsDir was changed after construction
+      this._segmentsManifestPath = path.join(this.persistEmbeddingsDir, 'segments.json');
+    } catch (e) { }
+  }
+
+  async _openNewSegment() {
+    await this._ensureEmbeddingsDir();
+    const name = `segment-${Date.now()}.ndjson`;
+    const full = path.join(this.persistEmbeddingsDir, name);
+    this._currentSegment = { path: full, createdAt: Date.now(), size: 0 };
+    // ensure file exists
+    await fs.writeFile(full, '', 'utf8');
+    // ensure manifest exists
+    try {
+      if (!fsSync.existsSync(this._segmentsManifestPath)) {
+        await fs.writeFile(this._segmentsManifestPath, JSON.stringify({ segments: [] }), 'utf8');
+      }
+    } catch (e) { /* ignore */ }
+    return this._currentSegment;
+  }
+
+  async _appendToSegment(line) {
+    if (!this._currentSegment) await this._openNewSegment();
+    await fs.appendFile(this._currentSegment.path, line, 'utf8');
+    this._currentSegment.size += Buffer.byteLength(line, 'utf8');
+    const sizeMB = this._currentSegment.size / (1024 * 1024);
+    const age = Date.now() - this._currentSegment.createdAt;
+    if (sizeMB >= this.persistEmbSegmentSizeMB || age >= this.persistEmbSegmentAgeMs) {
+      // rotate: gzip current and start new
+      await this._rotateSegment(this._currentSegment.path);
+      this._currentSegment = null;
+    }
+  }
+
+  async _rotateSegment(filePath) {
+    try {
+      const gzPath = `${filePath}.gz`;
+      // write to a temp gz first, then rename for atomicity
+      const tmpGz = `${gzPath}.tmp`;
+      await new Promise((resolve, reject) => {
+        const rs = fsSync.createReadStream(filePath);
+        const ws = fsSync.createWriteStream(tmpGz);
+        const gzip = zlib.createGzip();
+        rs.pipe(gzip).pipe(ws).on('finish', resolve).on('error', reject);
+      });
+      // rename temp to final
+      await fs.rename(tmpGz, gzPath);
+      // remove original
+      await fs.unlink(filePath);
+      // update manifest atomically
+      try {
+        const stat = await fs.stat(gzPath);
+        const entry = { file: path.basename(gzPath), size: stat.size, createdAt: Date.now() };
+        await this._appendToManifest(entry);
+      } catch (e) { /* ignore manifest update failure */ }
+    } catch (e) {
+      this.logger.warn({ e }, 'Failed to rotate embedding segment');
+    }
+  }
+
+  async _appendToManifest(entry) {
+    try {
+      await this._ensureEmbeddingsDir();
+      let manifest = { segments: [] };
+      try {
+        const raw = await fs.readFile(this._segmentsManifestPath, 'utf8');
+        manifest = JSON.parse(raw);
+      } catch (e) { /* no manifest yet */ }
+      manifest.segments = manifest.segments || [];
+      manifest.segments.push(entry);
+      const tmp = `${this._segmentsManifestPath}.tmp`;
+      await fs.writeFile(tmp, JSON.stringify(manifest), 'utf8');
+      await fs.rename(tmp, this._segmentsManifestPath);
+    } catch (e) {
+      this.logger.warn({ e }, 'Failed to update segments manifest');
     }
   }
 
