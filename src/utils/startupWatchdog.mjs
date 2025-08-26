@@ -1,4 +1,11 @@
-export function createStartupWatchdog({timeoutMs = 30000, intervalMs = 5000} = {}) {
+export const STARTUP_TIMEOUT_MS = (() => {
+  const parsed = Number(process.env.STARTUP_TIMEOUT_MS)
+  // default: fail-fast, conservative 15s for CI containers
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 15000
+})()
+
+export function createStartupWatchdog({ timeoutMs = STARTUP_TIMEOUT_MS, intervalMs = 5000 } = {}) {
+  // Default startup timeout is conservative but short to fail fast in CI or container restarts.
   let timer = null
   let started = false
 

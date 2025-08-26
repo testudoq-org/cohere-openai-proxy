@@ -15,15 +15,13 @@ const require = createRequire(import.meta.url);
 import Pino from 'pino';
 import promClient from 'prom-client';
 import { createStartupWatchdog } from './utils/startupWatchdog.mjs';
-import { httpAgent, httpsAgent, applyGlobalAgents } from './utils/httpAgent.mjs';
+import { httpAgent, httpsAgent, applyGlobalAgents, EXTERNAL_API_TIMEOUT_MS } from './utils/httpAgent.mjs';
 import { createCohereClient } from './utils/cohereClientFactory.mjs';
 
 import LruTtlCache from './utils/lruTtlCache.mjs';
 import RAGDocumentManager from './ragDocumentManager.mjs';
 import ConversationManager from './conversationManager.mjs';
 import diagnostics from './middleware/diagnostics.mjs';
-import { retry } from './utils/retry.mjs';
-import { SimpleCircuitBreaker } from './utils/circuitBreaker.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -80,13 +78,12 @@ class EnhancedCohereRAGServer {
       embeddingBatchesProcessed: new promClient.Gauge({ name: 'rag_embedding_batches_processed', help: 'Embedding batches processed' }),
       embeddingRequests: new promClient.Gauge({ name: 'rag_embedding_requests', help: 'Embedding requests made' }),
     };
-  // Circuit breaker for external Cohere API calls
-  this.cohereCircuit = new SimpleCircuitBreaker({ failureThreshold: Number(process.env.COHERE_CB_FAILURES) || 5, resetTimeoutMs: Number(process.env.COHERE_CB_RESET_MS) || 10000 });
   }
 
   async initializeSupportedModels() {
     try {
-      const response = await retry(() => this.cohereCircuit.exec(() => this.cohere.models.list()), 3, 200);
+      // Delegate to the wrapped cohere client — the client factory applies retry + circuit behavior.
+      const response = await this.cohere.models.list();
       const models = response?.models ?? response?.body?.models ?? [];
       this.supportedModels = new Set(models.map((m) => m.name));
       logger.info({ supportedModels: Array.from(this.supportedModels) }, 'Supported Cohere models');
@@ -233,19 +230,19 @@ class EnhancedCohereRAGServer {
     const payload = { model, message: conversationData.message, temperature: temperature || 0.7, max_tokens: maxTokens || 512 };
     if (conversationData.chatHistory && conversationData.chatHistory.length > 0) payload.chat_history = conversationData.chatHistory;
     if (conversationData.preamble) payload.preamble = conversationData.preamble;
-
+  
     try {
       const sent = nowMs();
       if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:call:start', model, payloadSizeChars: String(JSON.stringify(payload).length), start: sent });
-
+  
       // If Cohere client accepts agent, try to use it (best-effort). Otherwise rely on globalAgent.
       let callFn = () => this.cohere.chat(payload);
       if (this.cohere && typeof this.cohere.chat === 'function') {
         // prefer existing SDK behavior; many SDKs accept an options object but not all — keep best-effort
         callFn = () => this.cohere.chat(payload);
       }
-
-      const resp = await retry(() => this.cohereCircuit.exec(callFn), 3, 200);
+  
+      const resp = await callFn();
       if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:call:end', model, durationMs: nowMs() - sent });
       return resp;
     } catch (err) {
@@ -285,7 +282,8 @@ class EnhancedCohereRAGServer {
   }
 
   async start() {
-    const watchdog = createStartupWatchdog({ timeoutMs: Number(process.env.STARTUP_TIMEOUT_MS) || 30000, intervalMs: 5000 });
+    // Let createStartupWatchdog use its internal default (which prefers env override).
+    const watchdog = createStartupWatchdog();
     watchdog.start();
     try {
       await this.initializeSupportedModels();
