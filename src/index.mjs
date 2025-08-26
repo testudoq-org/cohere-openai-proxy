@@ -20,6 +20,7 @@ import { httpAgent, httpsAgent, applyGlobalAgents } from './utils/httpAgent.mjs'
 import LruTtlCache from './utils/lruTtlCache.mjs';
 import RAGDocumentManager from './ragDocumentManager.mjs';
 import ConversationManager from './conversationManager.mjs';
+import diagnostics from './middleware/diagnostics.mjs';
 import { retry } from './utils/retry.mjs';
 import { SimpleCircuitBreaker } from './utils/circuitBreaker.mjs';
 
@@ -89,8 +90,10 @@ class EnhancedCohereRAGServer {
 
   setupMiddleware() {
     this.app.use(helmet());
-    this.app.use((req, res, next) => { req.log = logger; next(); });
-    this.app.use(morgan('combined'));
+  this.app.use((req, res, next) => { req.log = logger; next(); });
+  // lightweight diagnostics middleware (attach traceId and timing)
+  this.app.use(diagnostics);
+  this.app.use(morgan('combined'));
 
     const limiter = rateLimit({ windowMs: this.RATE_LIMIT_WINDOW_MS, max: this.RATE_LIMIT_MAX_REQUESTS });
     this.app.use(limiter);
