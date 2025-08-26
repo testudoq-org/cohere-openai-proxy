@@ -35,7 +35,10 @@ function generateTraceId() { return Date.now().toString(36) + Math.random().toSt
 function diagLog(obj) { if (DIAGNOSTICS_DISABLED) return; try { console.log(JSON.stringify(obj)); } catch (e) {} }
 
 // Best-effort: apply global agents to improve connection reuse
-applyGlobalAgents();
+// Prefer explicit SDK agent injection; only set global agents when explicitly enabled.
+if (process.env.OUTBOUND_USE_GLOBAL_AGENT === '1' || String(process.env.OUTBOUND_USE_GLOBAL_AGENT || '').toLowerCase() === 'true') {
+  applyGlobalAgents();
+}
 
 class EnhancedCohereRAGServer {
   constructor({ port = process.env.PORT || 3000 } = {}) {

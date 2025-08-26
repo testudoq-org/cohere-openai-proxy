@@ -31,6 +31,10 @@ This assistant analyzes user prompts for clarity, structure, and effectiveness, 
 
 See `userguide.md` for detailed instructions and examples.
 
+## Connection reuse and agents
+
+This project creates dedicated http/https agents for outbound connections and prefers passing them directly to SDK constructors to avoid mutating Node's global agents. If you need to apply these agents globally (for example in special integration environments), set `OUTBOUND_USE_GLOBAL_AGENT=1` in your environment; otherwise leave it disabled.
+
 
 ### Licence Summary
 
