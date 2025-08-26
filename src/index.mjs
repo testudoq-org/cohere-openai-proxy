@@ -41,7 +41,17 @@ class EnhancedCohereRAGServer {
   constructor({ port = process.env.PORT || 3000 } = {}) {
     this.app = express();
     this.port = port;
-    this.cohere = new CohereClient({ token: process.env.COHERE_API_KEY });
+    // Instantiate Cohere client. Try to pass httpsAgent for connection reuse if SDK supports it.
+    try {
+      this.cohere = new CohereClient({ token: process.env.COHERE_API_KEY, agent: httpsAgent });
+    } catch (e1) {
+      try {
+        this.cohere = new CohereClient({ token: process.env.COHERE_API_KEY, httpsAgent });
+      } catch (e2) {
+        // Fallback to default constructor if SDK does not accept agent options
+        this.cohere = new CohereClient({ token: process.env.COHERE_API_KEY });
+      }
+    }
 
     this.ragManager = new RAGDocumentManager(this.cohere, { logger });
     this.conversationManager = new ConversationManager(this.ragManager, { logger });
