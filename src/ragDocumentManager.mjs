@@ -30,6 +30,7 @@ class RAGDocumentManager {
       embeddingBatchesProcessed: 0,
       embeddingRequests: 0,
     };
+  this._diagDisabled = !!(process.env.SKIP_DIAGNOSTICS && ['1', 'true', 'yes'].includes(String(process.env.SKIP_DIAGNOSTICS).toLowerCase()));
   // Persistence for index
   this.persistPath = process.env.RAG_PERSIST_PATH || path.join(process.cwd(), '.rag_index.json');
   // Embedding persistence (segmented ndjson) to avoid large JSON memory spikes
@@ -123,6 +124,8 @@ class RAGDocumentManager {
       const texts = batch.map(b => b.text);
       try {
         this.metrics.embeddingRequests += 1;
+        if (!this._diagDisabled) this.logger.info({ batchSize: batch.length, lengths: texts.map(t => (t||'').length) }, 'embedding:batch:start');
+        const batchStart = Date.now();
         const resp = await this._callEmbedApi(texts);
         const embeddings = resp?.body?.embeddings ?? resp?.embeddings ?? resp;
         if (!Array.isArray(embeddings) || embeddings.length !== texts.length) {
@@ -143,6 +146,7 @@ class RAGDocumentManager {
           this.metrics.embeddingBatchesProcessed += 1;
           // persist index periodically to capture newly embedded docs
           try { await this._saveIndex(); } catch (e) { this.logger.warn({ e }, 'Failed to save index after embedding batch'); }
+          if (!this._diagDisabled) this.logger.info({ batchSize: batch.length, durationMs: Date.now() - batchStart }, 'embedding:batch:done');
         }
       } catch (err) {
         this.logger.warn({ err }, 'Batch embedding failed — requeueing items with delay');
@@ -160,17 +164,20 @@ class RAGDocumentManager {
   // Centralized call to Cohere embed API with simple retries and robust response parsing
   async _callEmbedApi(texts, attempts = 3) {
     let lastErr;
+    const start = Date.now();
     for (let attempt = 1; attempt <= attempts; attempt++) {
       try {
         const payload = { model: this.embeddingModel, texts };
+        if (!this._diagDisabled) this.logger.info({ attempt, batchSize: texts.length, payloadSizeChars: String(JSON.stringify(payload).length) }, 'embedding:api:call');
         const resp = await this.cohere.embed(payload);
         const embeddings = resp?.body?.embeddings ?? resp?.embeddings ?? resp;
         if (!embeddings) throw new Error('No embeddings in response');
+        if (!this._diagDisabled) this.logger.info({ attempt, batchSize: texts.length, durationMs: Date.now() - start }, 'embedding:api:success');
         return { body: { embeddings } };
       } catch (err) {
         lastErr = err;
         const backoff = 100 * Math.pow(2, attempt - 1);
-        this.logger.warn({ err, attempt }, 'Embedding API call failed; retrying after backoff');
+        this.logger.warn({ err, attempt, batchSize: texts.length }, 'Embedding API call failed; retrying after backoff');
         await new Promise(r => setTimeout(r, backoff));
       }
     }
