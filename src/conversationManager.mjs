@@ -9,6 +9,16 @@ class ConversationManager {
     this.cleanupInterval = null;
     // use LRU for ephemeral sessions if desired
     this.sessionLimit = 1000;
+
+    // Prompt batching config (tunable via env)
+    this._promptDelayMs = Number(process.env.PROMPT_BATCH_DELAY_MS) || 50;
+    this._promptMaxBatch = Number(process.env.PROMPT_MAX_BATCH_SIZE) || 8;
+    this._promptQueueLimit = Number(process.env.PROMPT_BATCH_QUEUE_LIMIT) || 1000;
+
+    // internal prompt queue and debounce timer
+    this._promptQueue = []; // items: { id, promptPayload, resolve, reject }
+    this._promptTimer = null;
+    this._flushing = false;
   }
 
   getConversation(sessionId) {
@@ -101,7 +111,92 @@ class ConversationManager {
 
   getStats() { return { activeConversations: this.conversations.size, totalMessages: Array.from(this.conversations.values()).reduce((s, ses) => s + ses.messages.length, 0), ragEnabled: !!this.ragManager } }
 
-  async shutdown() { /* allow graceful cleanup hooks if needed */ }
+  // Public: enqueue a prompt for batching. Returns a Promise resolved/rejected per-prompt.
+  sendPrompt(promptPayload) {
+    // Bound the queue
+    if (this._promptQueue.length + 1 > this._promptQueueLimit) {
+      const err = new Error('Prompt queue limit exceeded');
+      err.code = 429;
+      return Promise.reject(err);
+    }
+
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2,8);
+    return new Promise((resolve, reject) => {
+      this._promptQueue.push({ id, promptPayload, resolve, reject });
+
+      // If we reached max batch size, flush immediately
+      if (this._promptQueue.length >= this._promptMaxBatch) {
+        if (this._promptTimer) { clearTimeout(this._promptTimer); this._promptTimer = null; }
+        // flush asynchronously
+        void this._flushPromptBatch();
+        return;
+      }
+
+      // ensure a single debounce timer is active
+      if (!this._promptTimer) {
+        this._promptTimer = setTimeout(() => {
+          this._promptTimer = null;
+          void this._flushPromptBatch();
+        }, this._promptDelayMs);
+      }
+    });
+  }
+
+  // Internal: flush current queued prompts (all at once)
+  async _flushPromptBatch() {
+    if (this._flushing) return;
+    if (this._promptQueue.length === 0) return;
+    this._flushing = true;
+
+    const batch = this._promptQueue.splice(0, this._promptQueue.length);
+    // minimal diagnostic
+    try {
+      this.logger.info?.({ batchSize: batch.length }, 'prompt:batch:flush');
+    } catch (e) { /* ignore logging errors */ }
+
+    // Prepare per-item call promises, keep errors per-item
+    const calls = batch.map((item) => {
+      try {
+        const call = (this.ragManager && this.ragManager.cohere && typeof this.ragManager.cohere.chat === 'function')
+          ? this.ragManager.cohere.chat(item.promptPayload)
+          : Promise.reject(new Error('No Cohere client available'));
+        return call
+          .then((resp) => ({ id: item.id, status: 'fulfilled', resp }))
+          .catch((err) => ({ id: item.id, status: 'rejected', err }));
+      } catch (err) {
+        return Promise.resolve({ id: item.id, status: 'rejected', err });
+      }
+    });
+
+    // Run in parallel but capture per-call results
+    const results = await Promise.all(calls);
+
+    // Resolve/reject original promises individually
+    for (const r of results) {
+      const item = batch.find(b => b.id === r.id);
+      if (!item) continue;
+      if (r.status === 'fulfilled') item.resolve(r.resp);
+      else {
+        // attach code if missing for queue-limit style handling
+        if (r.err && !r.err.code) r.err.code = r.err.code || 'PROMPT_ERROR';
+        item.reject(r.err);
+      }
+    }
+
+    this._flushing = false;
+  }
+
+  // Ensure queued prompts are flushed on shutdown
+  async shutdown() {
+    if (this._promptTimer) { clearTimeout(this._promptTimer); this._promptTimer = null; }
+    // flush remaining items
+    try {
+      await this._flushPromptBatch();
+    } catch (e) {
+      this.logger.warn?.({ e }, 'prompt:shutdown:flush_failed');
+    }
+    /* allow other graceful cleanup hooks if needed */
+  }
 }
 
 export default ConversationManager;

@@ -16,6 +16,7 @@ import Pino from 'pino';
 import promClient from 'prom-client';
 import { createStartupWatchdog } from './utils/startupWatchdog.mjs';
 import { httpAgent, httpsAgent, applyGlobalAgents } from './utils/httpAgent.mjs';
+import { createCohereClient } from './utils/cohereClientFactory.mjs';
 
 import LruTtlCache from './utils/lruTtlCache.mjs';
 import RAGDocumentManager from './ragDocumentManager.mjs';
@@ -28,6 +29,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const logger = Pino({ level: process.env.LOG_LEVEL || 'info' });
+
+const { client: _defaultCohereClient, acceptedAgentOption: _defaultCohereAcceptedAgentOption } = await createCohereClient({ token: process.env.COHERE_API_KEY, agentOptions: httpsAgent, logger });
 
 const DIAGNOSTICS_DISABLED = !!(process.env.SKIP_DIAGNOSTICS && ['1', 'true', 'yes'].includes(String(process.env.SKIP_DIAGNOSTICS).toLowerCase()));
 function nowMs() { return Number(process.hrtime.bigint() / 1000000n); }
@@ -44,17 +47,9 @@ class EnhancedCohereRAGServer {
   constructor({ port = process.env.PORT || 3000 } = {}) {
     this.app = express();
     this.port = port;
-    // Instantiate Cohere client. Try to pass httpsAgent for connection reuse if SDK supports it.
-    try {
-      this.cohere = new CohereClient({ token: process.env.COHERE_API_KEY, agent: httpsAgent });
-    } catch (e1) {
-      try {
-        this.cohere = new CohereClient({ token: process.env.COHERE_API_KEY, httpsAgent });
-      } catch (e2) {
-        // Fallback to default constructor if SDK does not accept agent options
-        this.cohere = new CohereClient({ token: process.env.COHERE_API_KEY });
-      }
-    }
+    // Instantiate Cohere client using centralized factory (created at module import).
+    this.cohere = _defaultCohereClient;
+    this.cohereAcceptedAgentOption = _defaultCohereAcceptedAgentOption;
 
     this.ragManager = new RAGDocumentManager(this.cohere, { logger });
     this.conversationManager = new ConversationManager(this.ragManager, { logger });

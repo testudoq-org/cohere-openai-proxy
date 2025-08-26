@@ -1,9 +1,9 @@
 import http from 'http';
 import https from 'https';
 
-const maxSockets = Number(process.env.OUTBOUND_MAX_SOCKETS) || 50;
-export const httpAgent = new http.Agent({ keepAlive: true, maxSockets });
-export const httpsAgent = new https.Agent({ keepAlive: true, maxSockets });
+export const OUTBOUND_MAX_SOCKETS = Number(process.env.OUTBOUND_MAX_SOCKETS) || 50;
+export const httpAgent = new http.Agent({ keepAlive: true, maxSockets: OUTBOUND_MAX_SOCKETS });
+export const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: OUTBOUND_MAX_SOCKETS });
 
 /**
  * Apply the pre-created agents to Node's globalAgent values.
