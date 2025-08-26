@@ -19,6 +19,17 @@ class RAGDocumentManager {
   this.embeddingQueue = []; // items: { key, text }
   this.embeddingWorkerRunning = false;
   this.embeddingWorkerDelayMs = Number(process.env.EMBEDDING_WORKER_DELAY_MS) || 100;
+    // Metrics
+    this.metrics = {
+      embeddingQueueLength: 0,
+      embeddingFailures: 0,
+      embeddingBatchesProcessed: 0,
+      embeddingRequests: 0,
+    };
+    // Persistence
+    this.persistPath = process.env.RAG_PERSIST_PATH || path.join(process.cwd(), '.rag_index.json');
+    // load persisted index asynchronously
+    this._loadIndex().catch((e) => this.logger.info({ e }, 'No persisted RAG index loaded'));
   }
 
   async indexCodebase(projectPath, options = {}) {
@@ -69,13 +80,16 @@ class RAGDocumentManager {
         this.logger.warn({ err, file: fp }, 'Skipping file');
       }
     }
-    return { indexed: files.length };
+  // persist index after indexing job completes
+  try { await this._saveIndex(); } catch (e) { this.logger.warn({ e }, 'Failed to save index after _doIndex'); }
+  return { indexed: files.length };
   }
 
   // Enqueue a single text to be embedded by the background worker
   enqueueEmbedding(key, text) {
     try {
-      this.embeddingQueue.push({ key, text });
+  this.embeddingQueue.push({ key, text });
+  this.metrics.embeddingQueueLength = this.embeddingQueue.length;
       if (!this.embeddingWorkerRunning) {
         // start worker but don't await - it will run asynchronously
         this._processEmbeddingQueue().catch((e) => this.logger.warn({ e }, 'Embedding worker crashed'));
@@ -90,19 +104,26 @@ class RAGDocumentManager {
     this.embeddingWorkerRunning = true;
     while (this.embeddingQueue.length > 0) {
       const batch = this.embeddingQueue.splice(0, this.maxEmbeddingBatch);
+      this.metrics.embeddingQueueLength = this.embeddingQueue.length;
       const texts = batch.map(b => b.text);
       try {
+        this.metrics.embeddingRequests += 1;
         const resp = await this._callEmbedApi(texts);
         const embeddings = resp?.body?.embeddings ?? resp?.embeddings ?? resp;
         if (!Array.isArray(embeddings) || embeddings.length !== texts.length) {
           this.logger.warn({ received: Array.isArray(embeddings) ? embeddings.length : typeof embeddings }, 'Unexpected embedding response shape');
+          this.metrics.embeddingFailures += 1;
         } else {
           for (let i = 0; i < batch.length; i++) {
             this.embeddingCache.set(batch[i].key, embeddings[i]);
           }
+          this.metrics.embeddingBatchesProcessed += 1;
+          // persist index periodically to capture newly embedded docs
+          try { await this._saveIndex(); } catch (e) { this.logger.warn({ e }, 'Failed to save index after embedding batch'); }
         }
       } catch (err) {
         this.logger.warn({ err }, 'Batch embedding failed — requeueing items with delay');
+        this.metrics.embeddingFailures += 1;
         // simple requeue with delay to avoid tight failure loops
         this.embeddingQueue.unshift(...batch);
         await new Promise(r => setTimeout(r, 1000));
@@ -131,6 +152,29 @@ class RAGDocumentManager {
       }
     }
     throw lastErr;
+  }
+
+  async _saveIndex() {
+    try {
+      const snapshot = {
+        documents: Array.from(this.documents.entries()),
+        documentIndex: Array.from(this.documentIndex.entries()).map(([k, s]) => [k, Array.from(s)]),
+      };
+      await fs.writeFile(this.persistPath, JSON.stringify(snapshot), 'utf8');
+    } catch (e) {
+      this.logger.warn({ e }, 'Failed to persist RAG index');
+    }
+  }
+
+  async _loadIndex() {
+    try {
+      const raw = await fs.readFile(this.persistPath, 'utf8');
+      const snap = JSON.parse(raw);
+      if (snap?.documents) this.documents = new Map(snap.documents);
+      if (snap?.documentIndex) this.documentIndex = new Map(snap.documentIndex.map(([k, arr]) => [k, new Set(arr)]));
+    } catch (e) {
+      // no persisted index is acceptable
+    }
   }
 
   async retrieveRelevantDocuments(query, options = {}) {
@@ -238,7 +282,9 @@ class RAGDocumentManager {
 
   clearIndex() { this.documents.clear(); this.documentIndex.clear(); this.embeddingCache.clear(); }
 
-  async shutdown() { /* nothing heavy for now */ }
+  async shutdown() { 
+    try { await this._saveIndex(); } catch (e) { this.logger.warn({ e }, 'Failed to save index on shutdown'); }
+  }
 }
 
 export default RAGDocumentManager;
