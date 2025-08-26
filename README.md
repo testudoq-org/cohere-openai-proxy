@@ -31,6 +31,42 @@ This assistant analyzes user prompts for clarity, structure, and effectiveness, 
 
 See `userguide.md` for detailed instructions and examples.
 
+## Connection reuse and agents
+
+This project creates dedicated http/https agents for outbound connections and prefers passing them directly to SDK constructors to avoid mutating Node's global agents. If you need to apply these agents globally (for example in special integration environments), set `OUTBOUND_USE_GLOBAL_AGENT=1` in your environment; otherwise leave it disabled.
+
+## Testing
+
+This repo uses Vitest for tests. Tests are split so you can run quick unit tests or longer integration/api tests separately.
+
+- Run the full test suite:
+
+```powershell
+npx vitest --run
+```
+
+- Run only unit tests (fast):
+
+```powershell
+npx vitest test/utils --run
+```
+
+- Run only API/integration tests (real sockets, slower):
+
+```powershell
+npx vitest test/api --run
+```
+
+- Run a single test file:
+
+```powershell
+npx vitest test/api/agent-http-injection.test.mjs --run
+```
+
+Notes:
+- Integration tests under `test/api` open real sockets and may be slower. Run them separately in CI if you want a quick unit-only pipeline.
+- If you see different behavior around socket reuse for "no explicit agent" requests, it may be caused by local/global agent mutation (controlled by `OUTBOUND_USE_GLOBAL_AGENT` or other test harnesses).
+
 
 ### Licence Summary
 

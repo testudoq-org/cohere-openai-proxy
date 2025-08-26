@@ -1,5 +1,7 @@
 export class SimpleCircuitBreaker {
-  constructor({ failureThreshold = 5, resetTimeoutMs = 10000 } = {}) {
+  // Default failureThreshold lowered so transient errors + retries are more likely to
+  // trigger the circuit before exhausting retries (e.g. with 3 retry attempts).
+  constructor({ failureThreshold = 2, resetTimeoutMs = 10000 } = {}) {
     this.failureThreshold = failureThreshold;
     this.resetTimeoutMs = resetTimeoutMs;
     this.failures = 0;

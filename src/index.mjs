@@ -15,19 +15,20 @@ const require = createRequire(import.meta.url);
 import Pino from 'pino';
 import promClient from 'prom-client';
 import { createStartupWatchdog } from './utils/startupWatchdog.mjs';
-import { httpAgent, httpsAgent, applyGlobalAgents } from './utils/httpAgent.mjs';
+import { httpAgent, httpsAgent, applyGlobalAgents, EXTERNAL_API_TIMEOUT_MS } from './utils/httpAgent.mjs';
+import { createCohereClient } from './utils/cohereClientFactory.mjs';
 
 import LruTtlCache from './utils/lruTtlCache.mjs';
 import RAGDocumentManager from './ragDocumentManager.mjs';
 import ConversationManager from './conversationManager.mjs';
 import diagnostics from './middleware/diagnostics.mjs';
-import { retry } from './utils/retry.mjs';
-import { SimpleCircuitBreaker } from './utils/circuitBreaker.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const logger = Pino({ level: process.env.LOG_LEVEL || 'info' });
+
+const { client: _defaultCohereClient, acceptedAgentOption: _defaultCohereAcceptedAgentOption } = await createCohereClient({ token: process.env.COHERE_API_KEY, agentOptions: httpsAgent, logger });
 
 const DIAGNOSTICS_DISABLED = !!(process.env.SKIP_DIAGNOSTICS && ['1', 'true', 'yes'].includes(String(process.env.SKIP_DIAGNOSTICS).toLowerCase()));
 function nowMs() { return Number(process.hrtime.bigint() / 1000000n); }
@@ -35,23 +36,18 @@ function generateTraceId() { return Date.now().toString(36) + Math.random().toSt
 function diagLog(obj) { if (DIAGNOSTICS_DISABLED) return; try { console.log(JSON.stringify(obj)); } catch (e) {} }
 
 // Best-effort: apply global agents to improve connection reuse
-applyGlobalAgents();
+// Prefer explicit SDK agent injection; only set global agents when explicitly enabled.
+if (process.env.OUTBOUND_USE_GLOBAL_AGENT === '1' || String(process.env.OUTBOUND_USE_GLOBAL_AGENT || '').toLowerCase() === 'true') {
+  applyGlobalAgents();
+}
 
 class EnhancedCohereRAGServer {
   constructor({ port = process.env.PORT || 3000 } = {}) {
     this.app = express();
     this.port = port;
-    // Instantiate Cohere client. Try to pass httpsAgent for connection reuse if SDK supports it.
-    try {
-      this.cohere = new CohereClient({ token: process.env.COHERE_API_KEY, agent: httpsAgent });
-    } catch (e1) {
-      try {
-        this.cohere = new CohereClient({ token: process.env.COHERE_API_KEY, httpsAgent });
-      } catch (e2) {
-        // Fallback to default constructor if SDK does not accept agent options
-        this.cohere = new CohereClient({ token: process.env.COHERE_API_KEY });
-      }
-    }
+    // Instantiate Cohere client using centralized factory (created at module import).
+    this.cohere = _defaultCohereClient;
+    this.cohereAcceptedAgentOption = _defaultCohereAcceptedAgentOption;
 
     this.ragManager = new RAGDocumentManager(this.cohere, { logger });
     this.conversationManager = new ConversationManager(this.ragManager, { logger });
@@ -82,13 +78,12 @@ class EnhancedCohereRAGServer {
       embeddingBatchesProcessed: new promClient.Gauge({ name: 'rag_embedding_batches_processed', help: 'Embedding batches processed' }),
       embeddingRequests: new promClient.Gauge({ name: 'rag_embedding_requests', help: 'Embedding requests made' }),
     };
-  // Circuit breaker for external Cohere API calls
-  this.cohereCircuit = new SimpleCircuitBreaker({ failureThreshold: Number(process.env.COHERE_CB_FAILURES) || 5, resetTimeoutMs: Number(process.env.COHERE_CB_RESET_MS) || 10000 });
   }
 
   async initializeSupportedModels() {
     try {
-      const response = await retry(() => this.cohereCircuit.exec(() => this.cohere.models.list()), 3, 200);
+      // Delegate to the wrapped cohere client — the client factory applies retry + circuit behavior.
+      const response = await this.cohere.models.list();
       const models = response?.models ?? response?.body?.models ?? [];
       this.supportedModels = new Set(models.map((m) => m.name));
       logger.info({ supportedModels: Array.from(this.supportedModels) }, 'Supported Cohere models');
@@ -235,19 +230,19 @@ class EnhancedCohereRAGServer {
     const payload = { model, message: conversationData.message, temperature: temperature || 0.7, max_tokens: maxTokens || 512 };
     if (conversationData.chatHistory && conversationData.chatHistory.length > 0) payload.chat_history = conversationData.chatHistory;
     if (conversationData.preamble) payload.preamble = conversationData.preamble;
-
+  
     try {
       const sent = nowMs();
       if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:call:start', model, payloadSizeChars: String(JSON.stringify(payload).length), start: sent });
-
+  
       // If Cohere client accepts agent, try to use it (best-effort). Otherwise rely on globalAgent.
       let callFn = () => this.cohere.chat(payload);
       if (this.cohere && typeof this.cohere.chat === 'function') {
         // prefer existing SDK behavior; many SDKs accept an options object but not all — keep best-effort
         callFn = () => this.cohere.chat(payload);
       }
-
-      const resp = await retry(() => this.cohereCircuit.exec(callFn), 3, 200);
+  
+      const resp = await callFn();
       if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:call:end', model, durationMs: nowMs() - sent });
       return resp;
     } catch (err) {
@@ -287,7 +282,8 @@ class EnhancedCohereRAGServer {
   }
 
   async start() {
-    const watchdog = createStartupWatchdog({ timeoutMs: Number(process.env.STARTUP_TIMEOUT_MS) || 30000, intervalMs: 5000 });
+    // Let createStartupWatchdog use its internal default (which prefers env override).
+    const watchdog = createStartupWatchdog();
     watchdog.start();
     try {
       await this.initializeSupportedModels();
