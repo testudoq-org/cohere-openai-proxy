@@ -1,4 +1,4 @@
-const COHERE_MODEL = process.env.COHERE_MODEL || 'command-a-reasoning-08-2025';
+const COHERE_MODEL = process.env.COHERE_MODEL || 'command-a-03-2025';
 import { CohereClient } from 'cohere-ai';
 import { httpsAgent as defaultHttpsAgent, EXTERNAL_API_TIMEOUT_MS } from './httpAgent.mjs';
 import { retry } from './retry.mjs';

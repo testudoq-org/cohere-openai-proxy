@@ -109,6 +109,11 @@ switch ($Action.ToLower()) {
         # Run container
         Write-Host "Starting container..." -ForegroundColor Yellow
         if ($Mode -eq "prod") {
+            # Ensure latest host .env is used for prod runs
+            if (Test-Path ".env") {
+                Write-Host "Copying .env -> dist/prod/.env"
+                Copy-Item -Path ".env" -Destination "dist/prod/.env" -Force
+            }
             $envFile = "dist/prod/.env"
             $envArg = ""
             if (Test-Path $envFile) {

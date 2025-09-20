@@ -82,7 +82,7 @@ class EnhancedCohereRAGServer {
 
   async initializeSupportedModels() {
     // Prefer env var, fallback to recommended default
-    const COHERE_MODEL = process.env.COHERE_MODEL || 'command-a-reasoning-08-2025';
+    const COHERE_MODEL = process.env.COHERE_MODEL || 'command-a-03-2025';
 
     // Curated list of recommended models
     const recommendedModels = [
@@ -96,7 +96,7 @@ class EnhancedCohereRAGServer {
     // Legacy/deprecated aliases (kept for backwards compatibility only)
     // These are not advertised as primary supported options.
     const legacyAliases = [
-      'command-r-plus',
+      'command-a-03-2025',
       'command-r',
       'command',
       'command-light'
@@ -219,7 +219,7 @@ class EnhancedCohereRAGServer {
     const startTime = nowMs();
     const traceId = req.headers['x-trace-id'] || generateTraceId();
     try {
-      const { messages, temperature = 0.7, max_tokens, model = 'command-r-plus', sessionId } = req.body;
+      const { messages, temperature = 0.7, max_tokens, model = process.env.COHERE_MODEL || 'command-a-03-2025', sessionId } = req.body;
       if (!Array.isArray(messages) || messages.length === 0) return res.status(400).json({ error: { message: 'Messages array required', type: 'invalid_request_error' } });
       if (!DIAGNOSTICS_DISABLED) {
         req._diag = { traceId, t0: startTime };
