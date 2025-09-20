@@ -1,5 +1,19 @@
 import dotenv from 'dotenv';
 dotenv.config();
+// Startup debug: verify dotenv/env-file values (COHERE_MODEL) are loaded early for Docker.
+console.log(
+  '[startup debug]',
+  {
+    COHERE_MODEL: process.env.COHERE_MODEL,
+    COHERE_API_KEY_present: !!process.env.COHERE_API_KEY,
+    COHERE_API_KEY_length: process.env.COHERE_API_KEY?.length,
+    PORT: process.env.PORT,
+    LOG_LEVEL: process.env.LOG_LEVEL,
+    EXTERNAL_API_TIMEOUT_MS: process.env.EXTERNAL_API_TIMEOUT_MS,
+    cwd: process.cwd(),
+    dotenv_path: '(default - no explicit path set)'
+  }
+);
 import express from 'express';
 import cors from 'cors';
 import { CohereClient } from 'cohere-ai';
@@ -29,6 +43,11 @@ const __dirname = path.dirname(__filename);
 const logger = Pino({ level: process.env.LOG_LEVEL || 'info' });
 
 const { client: _defaultCohereClient, acceptedAgentOption: _defaultCohereAcceptedAgentOption } = await createCohereClient({ token: process.env.COHERE_API_KEY, agentOptions: httpsAgent, logger });
+console.log('[startup debug] Cohere client creation result:', {
+  clientCreated: !!_defaultCohereClient,
+  acceptedAgentOption: _defaultCohereAcceptedAgentOption,
+  hasChatMethod: typeof _defaultCohereClient?.chat === 'function'
+});
 
 const DIAGNOSTICS_DISABLED = !!(process.env.SKIP_DIAGNOSTICS && ['1', 'true', 'yes'].includes(String(process.env.SKIP_DIAGNOSTICS).toLowerCase()));
 function nowMs() { return Number(process.hrtime.bigint() / 1000000n); }
@@ -263,24 +282,36 @@ class EnhancedCohereRAGServer {
     const payload = { model, message: conversationData.message, temperature: temperature || 0.7, max_tokens: maxTokens || 512 };
     if (conversationData.chatHistory && conversationData.chatHistory.length > 0) payload.chat_history = conversationData.chatHistory;
     if (conversationData.preamble) payload.preamble = conversationData.preamble;
-  
+
+    logger.info({ model, payloadKeys: Object.keys(payload), messageLength: conversationData.message?.length }, 'Preparing Cohere API call');
+
     try {
       const sent = nowMs();
       if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:call:start', model, payloadSizeChars: String(JSON.stringify(payload).length), start: sent });
-  
+
       // If Cohere client accepts agent, try to use it (best-effort). Otherwise rely on globalAgent.
       let callFn = () => this.cohere.chat(payload);
       if (this.cohere && typeof this.cohere.chat === 'function') {
         // prefer existing SDK behavior; many SDKs accept an options object but not all — keep best-effort
         callFn = () => this.cohere.chat(payload);
+      } else {
+        logger.error({ cohereClient: !!this.cohere, hasChatMethod: typeof this.cohere?.chat === 'function' }, 'Cohere client not properly initialized');
+        return null;
       }
-  
+
       const resp = await callFn();
+      logger.info({ model, responseReceived: !!resp, responseKeys: resp ? Object.keys(resp) : null }, 'Cohere API call successful');
       if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:call:end', model, durationMs: nowMs() - sent });
       return resp;
     } catch (err) {
-      if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:error', model, err: String(err?.message) });
-      logger.error({ err }, 'Cohere chat error');
+      logger.error({
+        err: err?.message,
+        model,
+        statusCode: err?.status || err?.statusCode,
+        response: err?.response?.data || err?.body,
+        stack: err?.stack
+      }, 'Cohere chat API error details');
+      if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:error', model, err: String(err?.message), statusCode: err?.status || err?.statusCode });
       return null;
     }
   }
@@ -309,7 +340,13 @@ class EnhancedCohereRAGServer {
 
   setupErrorHandling() {
     this.app.use((err, req, res, next) => {
-      logger.error({ err }, 'Unhandled error');
+      // Handle client errors (e.g., from body-parser) with their proper status codes
+      if (err.statusCode && err.statusCode >= 400 && err.statusCode < 500) {
+        logger.warn({ err, statusCode: err.statusCode }, 'Client error');
+        return res.status(err.statusCode).json({ error: { message: err.message, type: 'client_error' } });
+      }
+      // Handle server errors
+      logger.error({ err }, 'Unhandled server error');
       res.status(500).json({ error: { message: 'Internal server error', type: 'internal_server_error' } });
     });
   }
