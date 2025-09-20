@@ -81,15 +81,48 @@ class EnhancedCohereRAGServer {
   }
 
   async initializeSupportedModels() {
+    // Prefer env var, fallback to recommended default
+    const COHERE_MODEL = process.env.COHERE_MODEL || 'command-a-reasoning-08-2025';
+
+    // Curated list of recommended models
+    const recommendedModels = [
+      COHERE_MODEL,
+      'command-a-03-2025',
+      'command-a-reasoning-08-2025',
+      'command-a-vision-07-2025',
+      'command-r7b-12-2024'
+    ];
+
+    // Legacy/deprecated aliases (kept for backwards compatibility only)
+    // These are not advertised as primary supported options.
+    const legacyAliases = [
+      'command-r-plus',
+      'command-r',
+      'command',
+      'command-light'
+    ]; // legacy/deprecated aliases for backwards compatibility
+
     try {
       // Delegate to the wrapped cohere client — the client factory applies retry + circuit behavior.
       const response = await this.cohere.models.list();
       const models = response?.models ?? response?.body?.models ?? [];
-      this.supportedModels = new Set(models.map((m) => m.name));
-      logger.info({ supportedModels: Array.from(this.supportedModels) }, 'Supported Cohere models');
+      // Filter out deprecated aliases from primary supported models
+      let supported = models.map((m) => m.name).filter((name) => !legacyAliases.includes(name));
+      // Ensure recommended models are present
+      for (const m of recommendedModels) {
+        if (!supported.includes(m)) supported.push(m);
+      }
+      this.supportedModels = new Set(supported);
+      // Optionally: expose legacyAliases for internal use if needed
+      this.legacyAliases = legacyAliases;
+      logger.info({
+        supportedModels: Array.from(this.supportedModels),
+        legacyAliases: this.legacyAliases
+      }, 'Supported Cohere models (curated)');
     } catch (err) {
       logger.warn({ err: err?.message }, 'Failed to list models, using defaults');
-      this.supportedModels = new Set(['command-r-plus', 'command-r', 'command']);
+      this.supportedModels = new Set(recommendedModels);
+      this.legacyAliases = legacyAliases;
     }
   }
 

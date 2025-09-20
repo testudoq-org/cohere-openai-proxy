@@ -32,3 +32,4 @@ This ensures your environment variables are available and avoids issues with `.d
 cd /cop
 npm start
 ```
+Set the COHERE_MODEL environment variable (default: command-a-reasoning-08-2025) to control which Cohere model is used.
