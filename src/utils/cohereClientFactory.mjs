@@ -1,3 +1,10 @@
+/**
+ * Read COHERE_MODEL at runtime so dotenv-loaded values are respected in Docker.
+ */
+function getCohereModel() {
+  return process.env.COHERE_MODEL || 'command-a-03-2025';
+}
+
 import { CohereClient } from 'cohere-ai';
 import { httpsAgent as defaultHttpsAgent, EXTERNAL_API_TIMEOUT_MS } from './httpAgent.mjs';
 import { retry } from './retry.mjs';

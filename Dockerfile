@@ -18,6 +18,9 @@ RUN set -o pipefail && npm ci --only=production 2>&1 || (echo "npm ci failed, fa
 # Copy the rest of the application files from dist/prod into the image
 # Use --chown to ensure files are owned by the non-root node user in the final image
 COPY --chown=node:node dist/prod/ ./
+# Ensure .env is present in image and provide default COHERE_MODEL for Docker runs
+COPY --chown=node:node dist/prod/.env ./.env
+ENV COHERE_MODEL=command-a-03-2025
 
 # Build-time verification: output environment and list files copied to /app so it's visible in build logs
 RUN node -v || true

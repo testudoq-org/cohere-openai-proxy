@@ -23,7 +23,7 @@ Enable multi-turn conversations by maintaining conversation history, associating
   - Send the formatted, truncated history to Cohere.
   - Store the assistant’s reply in the session history.
   - Return `{ sessionId, messages, reply }` in the response.
-- Restrict multi-turn session logic to chat-capable models only (e.g., command-r, command-r-plus).
+- Restrict multi-turn session logic to chat-capable models only (e.g., command-r, command-a-03-2025).
 
 ---
 ## 3a. RAG Context Injection
