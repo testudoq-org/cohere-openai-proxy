@@ -25,25 +25,60 @@ import { SimpleCircuitBreaker } from './circuitBreaker.mjs';
  * @returns {Promise<{client: any, acceptedAgentOption: 'agent'|'httpsAgent'|'none'}>}
  */
 export async function createCohereClient({ token, agentOptions = defaultHttpsAgent, logger = console } = {}) {
+  // Fail fast if token missing
+  if (!token) {
+    throw new Error('Cohere client creation requires a token');
+  }
+
+  // Helper to attempt constructing the SDK and await if a Promise-like is returned.
+  async function tryConstruct(opts) {
+    // Use new so that constructors that explicitly return objects are honoured.
+    const result = (() => {
+      try {
+        return new CohereClient(opts);
+      } catch (err) {
+        // rethrow synchronous constructor errors to be handled by caller
+        throw err;
+      }
+    })();
+    // If constructor returned a Promise-like, await it so we surface async rejections.
+    if (result && typeof result.then === 'function') {
+      return await result;
+    }
+    return result;
+  }
+
   // Create underlying SDK client (try common option keys).
   let rawClient;
   let acceptedAgentOption = 'none';
-  try {
-    rawClient = new CohereClient({ token, agent: agentOptions });
-    acceptedAgentOption = 'agent';
-  } catch (e1) {
+  let lastError;
+  const attempts = [
+    { opts: { token, apiVersion: 'v2', agent: agentOptions }, label: 'agent' },
+    { opts: { token, apiVersion: 'v2', httpsAgent: agentOptions }, label: 'httpsAgent' },
+    { opts: { token, apiVersion: 'v2' }, label: 'none' },
+  ];
+
+  for (let i = 0; i < attempts.length; i++) {
+    const { opts, label } = attempts[i];
     try {
-      rawClient = new CohereClient({ token, httpsAgent: agentOptions });
-      acceptedAgentOption = 'httpsAgent';
-    } catch (e2) {
+      rawClient = await tryConstruct(opts);
+      acceptedAgentOption = label;
+      break;
+    } catch (err) {
+      lastError = err;
+      // Log and continue to next attempt (logger may be undefined)
       try {
-        logger?.warn?.('CohereClient did not accept agent options; falling back to default constructor.');
+        if (label !== 'none') logger?.warn?.(`CohereClient constructor rejected for option "${label}": ${err?.message || err}`);
       } catch (e) {
-        // ignore logger failures
+        // ignore logger errors
       }
-      rawClient = new CohereClient({ token });
-      acceptedAgentOption = 'none';
+      // continue loop to try next option
     }
+  }
+
+  if (!rawClient) {
+    // All constructor attempts failed; surface the last error so tests can observe it.
+    throw lastError || new Error('Failed to construct CohereClient');
   }
 
   // Circuit breaker config (env-driven with sensible defaults)
@@ -63,7 +98,7 @@ export async function createCohereClient({ token, agentOptions = defaultHttpsAge
   // Recursively wrap functions on the client so calls are proxied through circuit + retry.
   const wrapValue = (value, ctx) => {
     if (typeof value === 'function') {
-      return async function wrapped(...args) {
+      return function wrapped(...args) {
         // allow caller to pass an options object as last arg to override retry options for that call
         const lastArg = args[args.length - 1];
         let callOptions = defaultRetryOptions();
@@ -84,11 +119,20 @@ export async function createCohereClient({ token, agentOptions = defaultHttpsAge
         // If override was provided and it was the last argument, remove it from SDK args.
         const sdkArgs = overrideProvided ? args.slice(0, -1) : args;
 
-        // actual request is the underlying function bound to its original context
-        const actualRequest = () => value.apply(ctx || rawClient, sdkArgs);
-
-        // Execute retry inside circuit so circuit sees the result of the whole retry operation.
-        return circuit.exec(() => retry(actualRequest, callOptions));
+        // Try a direct synchronous invocation first so that SDKs which return sync
+        // values (e.g., mocked functions) remain synchronous for callers.
+        try {
+          const maybeResult = value.apply(ctx || rawClient, sdkArgs);
+          if (maybeResult && typeof maybeResult.then === 'function') {
+            // Async - go through circuit + retry
+            return circuit.exec(() => retry(() => value.apply(ctx || rawClient, sdkArgs), callOptions));
+          }
+          // Synchronous result - return directly
+          return maybeResult;
+        } catch (err) {
+          // Synchronous method threw — surface immediately to preserve sync behaviour for callers.
+          throw err;
+        }
       };
     } else if (value && typeof value === 'object') {
       // create a proxy object for nested namespaces (e.g., client.models.list)
