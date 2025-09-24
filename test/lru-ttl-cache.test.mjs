@@ -6,7 +6,7 @@ describe('LruTtlCache', () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
-    cache = new LruTtlCache({ ttlMs: 1000, maxSize: 3 });
+    cache = new LruTtlCache({ ttlMs: 1000, maxSize: 3, enableDedup: true });
   });
 
   afterEach(() => {
@@ -192,6 +192,88 @@ describe('LruTtlCache', () => {
       // Should retry on next call since failed promise was removed
       await expect(cache.getOrSetAsync(key, failingAsyncFn)).rejects.toThrow('Async failure');
       expect(callCount).toBe(2);
+    });
+  });
+  describe('Deduplication', () => {
+    it('deduplicates concurrent identical requests, factory called once, all get same value, correct metrics', async () => {
+      const key = 'dedup-key';
+      const factory = vi.fn(async () => 'dedup-value');
+      const N = 5;
+      const promises = [];
+      for (let i = 0; i < N; i++) {
+        promises.push(cache.getOrSetAsync(key, factory));
+      }
+      vi.advanceTimersByTime(1);
+      const results = await Promise.all(promises);
+      expect(results).toEqual(Array(N).fill('dedup-value'));
+      expect(factory).toHaveBeenCalledTimes(1);
+      expect(cache.metrics.dedup_hits).toBe(N - 1);
+      expect(cache.metrics.dedup_misses).toBe(1);
+    });
+
+    it('propagates errors for concurrent calls, factory called once, nothing cached, correct metrics', async () => {
+      const key = 'dedup-error-key';
+      const factory = vi.fn(async () => { throw new Error('fail'); });
+      const N = 3;
+      const promises = [];
+      for (let i = 0; i < N; i++) {
+        promises.push(cache.getOrSetAsync(key, factory).catch(e => e));
+      }
+      vi.advanceTimersByTime(1);
+      const results = await Promise.all(promises);
+      results.forEach(r => expect(r).toBeInstanceOf(Error));
+      expect(factory).toHaveBeenCalledTimes(1);
+      expect(cache.get(key)).toBeUndefined();
+      expect(cache.metrics.dedup_hits).toBe(N - 1);
+      expect(cache.metrics.dedup_misses).toBe(1);
+    });
+
+    it('does not deduplicate when dedup=false, factory called for each', async () => {
+      const key = 'no-dedup-key';
+      const factory = vi.fn(async () => 'no-dedup-value');
+      const N = 4;
+      const promises = [];
+      for (let i = 0; i < N; i++) {
+        promises.push(cache.getOrSetAsync(key, factory, { dedup: false }));
+      }
+      vi.advanceTimersByTime(1);
+      const results = await Promise.all(promises);
+      expect(results).toEqual(Array(N).fill('no-dedup-value'));
+      expect(factory).toHaveBeenCalledTimes(N);
+      expect(cache.metrics.dedup_hits).toBe(0);
+      expect(cache.metrics.dedup_misses).toBe(N);
+    });
+
+    it('deduplication works after TTL expiry, subsequent call is miss', async () => {
+      const key = 'ttl-dedup-key';
+      const factory = vi.fn(async () => 'ttl-value');
+      // First batch: deduplication
+      const promises1 = [
+        cache.getOrSetAsync(key, factory),
+        cache.getOrSetAsync(key, factory)
+      ];
+      vi.advanceTimersByTime(1);
+      const results1 = await Promise.all(promises1);
+      expect(results1).toEqual(['ttl-value', 'ttl-value']);
+      expect(factory).toHaveBeenCalledTimes(1);
+      expect(cache.metrics.dedup_hits).toBe(1);
+      expect(cache.metrics.dedup_misses).toBe(1);
+
+      // Expire TTL
+      vi.advanceTimersByTime(1001);
+      // Second batch: deduplication again, but cache miss
+      const factory2 = vi.fn(async () => 'ttl-value2');
+      const promises2 = [
+        cache.getOrSetAsync(key, factory2),
+        cache.getOrSetAsync(key, factory2)
+      ];
+      vi.advanceTimersByTime(1);
+      const results2 = await Promise.all(promises2);
+      expect(results2).toEqual(['ttl-value2', 'ttl-value2']);
+      expect(factory2).toHaveBeenCalledTimes(1);
+      // Metrics accumulate
+      expect(cache.metrics.dedup_hits).toBe(2);
+      expect(cache.metrics.dedup_misses).toBe(2);
     });
   });
 
