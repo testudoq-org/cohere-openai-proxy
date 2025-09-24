@@ -5,6 +5,27 @@ class LruTtlCache {
     this.map = new Map(); // preserves insertion order
   }
 
+  /**
+   * Helper to build a stable embed cache key.
+   * model: string model id
+   * input: string or array of strings
+   */
+  static makeEmbedKey(model, input) {
+    const arr = Array.isArray(input) ? input : [input];
+    return `embed:${model}:${JSON.stringify(arr)}`;
+  }
+
+  /**
+   * Helper to build a stable rerank cache key.
+   * model: string model id
+   * query: string
+   * documents: array of strings
+   */
+  static makeRerankKey(model, query, documents) {
+    const docs = Array.isArray(documents) ? documents : [documents];
+    return `rerank:${model}:${JSON.stringify(query)}:${JSON.stringify(docs)}`;
+  }
+
   _now() { return Date.now(); }
 
   get(key) {
@@ -17,10 +38,10 @@ class LruTtlCache {
     return entry.value;
   }
 
-  set(key, value) {
-    const expiry = this._now() + this.ttlMs;
+  set(key, value, { expiry } = {}) {
+    const realExpiry = typeof expiry === 'number' ? expiry : this._now() + this.ttlMs;
     if (this.map.has(key)) this.map.delete(key);
-    this.map.set(key, { value, expiry });
+    this.map.set(key, { value, expiry: realExpiry });
     // prune
     while (this.map.size > this.maxSize) {
       const oldest = this.map.keys().next().value;
@@ -40,25 +61,36 @@ class LruTtlCache {
    *   const result = await cache.getOrSetAsync(key, () => fetchSomething());
    */
   async getOrSetAsync(key, asyncFn) {
-    const existing = this.get(key);
-    if (typeof existing !== 'undefined') return existing;
+    const entry = this.map.get(key);
+    if (entry) {
+      // If expired and not a promise, treat as missing
+      if (this._now() > entry.expiry && !(entry.value && typeof entry.value.then === 'function')) {
+        this.map.delete(key);
+      } else {
+        return entry.value;
+      }
+    }
 
-    // Create a promise and insert immediately to prevent duplicate concurrent calls.
-    const p = (async () => {
+    // Store in-flight promise with "infinite" expiry so it won't be evicted by fake timers
+    let resolveP, rejectP;
+    const p = new Promise((resolve, reject) => {
+      resolveP = resolve;
+      rejectP = reject;
+    });
+    this.set(key, p, { expiry: Number.POSITIVE_INFINITY });
+
+    (async () => {
       try {
         const res = await asyncFn();
-        // replace stored promise with the resolved value (preserve TTL)
+        // Replace stored promise with resolved value and real expiry
         this.set(key, res);
-        return res;
+        resolveP(res);
       } catch (err) {
-        // remove failed promise so subsequent calls may retry
         this.delete(key);
-        throw err;
+        rejectP(err);
       }
     })();
 
-    // store the in-flight promise with TTL so other callers reuse it
-    this.set(key, p);
     return p;
   }
 }

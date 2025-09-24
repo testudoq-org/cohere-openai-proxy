@@ -166,7 +166,9 @@ describe('LruTtlCache', () => {
         cache.getOrSetAsync(key, slowAsyncFn),
         cache.getOrSetAsync(key, slowAsyncFn)
       ];
-
+    
+      vi.advanceTimersByTime(100);
+    
       const results = await Promise.all(promises);
 
       // All should get the same result
