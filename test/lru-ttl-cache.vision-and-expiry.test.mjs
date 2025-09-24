@@ -89,4 +89,14 @@ describe('LRU TTL Cache - Vision and Expiry', () => {
     await expect(cache.getOrSetAsync('key1', asyncFn)).rejects.toThrow('async error');
     expect(asyncFn).toHaveBeenCalledTimes(1);
   });
+
+  it('getOrSetAsync treats expired non-promise entry as missing and calls asyncFn', async () => {
+    // 'cache' is created in beforeEach
+    // Manually insert an expired non-promise value
+    cache.set('k-expire', 'old-value', { expiry: Date.now() - 1000 });
+    const asyncFn = vi.fn(async () => 'fresh-value');
+    const result = await cache.getOrSetAsync('k-expire', asyncFn);
+    expect(asyncFn).toHaveBeenCalledTimes(1);
+    expect(result).toBe('fresh-value');
+  });
 });

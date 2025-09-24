@@ -41,3 +41,8 @@ describe('Models config and validation', () => {
     expect(() => validateModelOrThrow('command-a-03-2025', 'embed')).toThrow('Model command-a-03-2025 does not support embed');
   });
 });
+
+it('validateModelOrThrow rejects missing modelId with 400', async () => {
+  const { validateModelOrThrow } = await import('../src/utils/cohereClientFactory.mjs');
+  expect(() => validateModelOrThrow()).toThrow('Model is required');
+});

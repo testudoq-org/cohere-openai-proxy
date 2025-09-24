@@ -2,14 +2,34 @@ import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const request = require('supertest');
-import EnhancedCohereRAGServer from '../src/index.mjs';
 import promClient from 'prom-client';
 
 let server;
 let app;
 
 beforeAll(async () => {
+  vi.resetModules();
   promClient.register.clear();
+  const { createMockCohereCtor, mockCohereModule } = await import('./utils/cohereClient.mjs');
+  // Provide a simple mock CohereClient constructor that returns an object implementing
+  // the minimal methods the server and tests exercise.
+  const MockCtor = createMockCohereCtor(function ctor(opts) {
+    return {
+      // chat returns a simple completed response
+      chat: async (payload) => ({ text: 'mock chat response', payload }),
+      // embed returns a shape compatible with tests
+      embed: async (payload) => ({ body: { embeddings: (Array.isArray(payload.texts) ? payload.texts.map(() => [0.1, 0.2]) : [[0.1, 0.2]]) } }),
+      // rerank returns results array
+      rerank: async (payload) => ({ results: (payload.documents || []).map((d, i) => ({ index: i, relevance_score: 1 })) }),
+      // vision may be absent or implemented; provide a basic implementation
+      vision: async (payload) => ({ data: payload.images || [] }),
+      models: {
+        list: async () => ({ models: [{ name: 'command-a-03-2025' }, { name: 'embed-english-v3.0' }, { name: 'rerank-multilingual-v3.0' }] })
+      }
+    };
+  });
+  mockCohereModule(MockCtor);
+  const { default: EnhancedCohereRAGServer } = await import('../src/index.mjs');
   const s = new EnhancedCohereRAGServer({ port: 0 });
   server = await s.start();
   app = server;

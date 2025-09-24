@@ -29,3 +29,13 @@ describe('callCohereChatAPI', () => {
     // In a real test, we'd mock prom-client more thoroughly, but for coverage, this suffices
   });
 });
+
+it('callCohereChatAPI throws for invalid client and propagates API errors', async () => {
+  const { callCohereChatAPI } = await import('../src/utils/cohereClientFactory.mjs');
+  // missing client-like
+  await expect(callCohereChatAPI(null, { model: 'm', message: 'x' })).rejects.toThrow('callCohereChatAPI requires a client with a .chat function');
+  // client.chat rejects -> should propagate
+  const mockChat = vi.fn(() => Promise.reject(new Error('chat failure')));
+  const mockClient = { chat: mockChat };
+  await expect(callCohereChatAPI(mockClient, { model: 'm', message: 'x' })).rejects.toThrow('chat failure');
+});
