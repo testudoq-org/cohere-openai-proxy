@@ -159,4 +159,15 @@ describe('Cohere client factory', () => {
     const { client } = await createCohereClient({ token: 'x', agentOptions: {}, logger: console });
     await expect(client.generate({})).rejects.toThrow(/async method error/);
   });
+
+  it('fails when all constructor attempts fail', async () => {
+    const mockCtor = createMockCohereCtor(() => {
+      throw new Error('all attempts fail');
+    });
+    mockCohereModule(mockCtor);
+
+    const { createCohereClient } = await import('../src/utils/cohereClientFactory.mjs');
+    await expect(createCohereClient({ token: 'x', agentOptions: {}, logger: console }))
+      .rejects.toThrow(/all attempts fail/);
+  });
 });

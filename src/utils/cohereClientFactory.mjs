@@ -11,6 +11,8 @@ import { retry } from './retry.mjs';
 import { SimpleCircuitBreaker } from './circuitBreaker.mjs';
 import LruTtlCache from './lruTtlCache.mjs';
 import promClient from 'prom-client';
+import fs from 'fs';
+import path from 'path';
 
 // Cohere request latency (seconds) and success/failure counters.
 // Labels: operation (e.g., chat), model (when available)
@@ -45,10 +47,21 @@ const cohereRequestFailure = new promClient.Counter({
  * @param {object} [params.logger=console] - logger with .warn available
  * @returns {Promise<{client: any, acceptedAgentOption: 'agent'|'httpsAgent'|'none'}>}
  */
-export async function createCohereClient({ token, agentOptions = defaultHttpsAgent, logger = console } = {}) {
+export async function createCohereClient({ token, agentOptions = defaultHttpsAgent, logger = console, model } = {}) {
   // Fail fast if token missing
   if (!token) {
     throw new Error('Cohere client creation requires a token');
+  }
+  // If a model was provided at client creation time, validate it early so callers
+  // receive a clear 400-style error rather than later runtime errors.
+  if (model) {
+    try {
+      validateModelOrThrow(model);
+    } catch (e) {
+      const err = new Error(e.message || 'Invalid model');
+      err.statusCode = e.statusCode || 400;
+      throw err;
+    }
   }
 
   // Helper to attempt constructing the SDK and await if a Promise-like is returned.
@@ -251,6 +264,66 @@ export async function createCohereClient({ token, agentOptions = defaultHttpsAge
   });
 
   return { client: wrappedClient, acceptedAgentOption };
+}
+
+/**
+ * Models config loader and validators
+ */
+let _modelsConfig = null;
+function loadModelsConfig() {
+  if (_modelsConfig) return _modelsConfig;
+  try {
+    const p = path.resolve(process.cwd(), 'models-config.json');
+    const raw = fs.readFileSync(p, 'utf8');
+    _modelsConfig = JSON.parse(raw);
+  } catch (e) {
+    // fallback to minimal defaults if file missing
+    _modelsConfig = {
+      models: [
+        { id: 'command-a-03-2025', type: 'generation', languages: ['en'], ttlMs: 120000 },
+        { id: 'command-r-plus-08-2024', type: 'generation', languages: ['en'], ttlMs: 120000 },
+        { id: 'embed-english-v3.0', type: 'embed', languages: ['en'], ttlMs: 600000 },
+        { id: 'embed-multilingual-v3.0', type: 'embed', languages: ['en'], ttlMs: 600000 },
+        { id: 'rerank-multilingual-v3.0', type: 'rerank', languages: ['en'], ttlMs: 600000 },
+        { id: 'command-a-vision-07-2025', type: 'vision', languages: ['en'], ttlMs: 600000 }
+      ]
+    };
+  }
+  return _modelsConfig;
+}
+
+/**
+ * Return list of models metadata.
+ */
+export function getModelsList() {
+  const cfg = loadModelsConfig();
+  return cfg.models || [];
+}
+
+/**
+ * Validate model id exists and (optionally) supports a modality.
+ * Throws an Error instance with statusCode = 400 for invalid models,
+ * or statusCode = 404 when the model doesn't support the requested operation.
+ */
+export function validateModelOrThrow(modelId, modality = null) {
+  if (!modelId) {
+    const err = new Error('Model is required');
+    err.statusCode = 400;
+    throw err;
+  }
+  const cfg = loadModelsConfig();
+  const found = (cfg.models || []).find((m) => m.id === modelId);
+  if (!found) {
+    const err = new Error(`Invalid model: ${modelId}`);
+    err.statusCode = 400;
+    throw err;
+  }
+  if (modality && found.type !== modality) {
+    const err = new Error(`Model ${modelId} does not support ${modality}`);
+    err.statusCode = 404;
+    throw err;
+  }
+  return found;
 }
 
 /**
