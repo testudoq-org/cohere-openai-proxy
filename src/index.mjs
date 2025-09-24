@@ -20,6 +20,7 @@ import { CohereClient } from 'cohere-ai';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import morgan from 'morgan';
+import compression from 'compression';
 import { encode } from 'gpt-3-encoder';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -147,6 +148,8 @@ class EnhancedCohereRAGServer {
 
   setupMiddleware() {
     this.app.use(helmet());
+    // Enable gzip/deflate compression for outbound responses
+    this.app.use(compression());
   this.app.use((req, res, next) => { req.log = logger; next(); });
   // lightweight diagnostics middleware (attach traceId and timing)
   this.app.use(diagnostics);
@@ -244,22 +247,99 @@ class EnhancedCohereRAGServer {
         req._diag = { traceId, t0: startTime };
         diagLog({ traceId, phase: 'server:received', route: req.path, start: startTime });
       }
-
+ 
       const effectiveSessionId = sessionId || this.generateId();
       const tAdd = nowMs();
       for (const m of messages) await this.conversationManager.addMessage(effectiveSessionId, m.role, this.extractContentString(m.content));
       if (!DIAGNOSTICS_DISABLED) diagLog({ traceId, phase: 'server:messages-added', durationMs: nowMs() - tAdd, messageCount: messages.length });
-
+ 
       const convoStart = nowMs();
       const conversationData = this.conversationManager.getFormattedHistoryWithRAG(effectiveSessionId);
       if (!DIAGNOSTICS_DISABLED) diagLog({ traceId, phase: 'server:conversation-built', durationMs: nowMs() - convoStart, ragCount: (this.conversationManager.conversations.get(effectiveSessionId)?.ragContext || []).length });
-
+ 
+      const streamingEnabled = !!(
+        process.env.COHERE_V2_STREAMING_SUPPORTED &&
+        ['1', 'true', 'yes'].includes(String(process.env.COHERE_V2_STREAMING_SUPPORTED).toLowerCase())
+      );
+ 
+      // Call the Cohere API (the client factory will inject stream: true into the payload when supported)
       const response = await this.callCohereChatAPI(model, conversationData, temperature, max_tokens, traceId);
       if (!response) return res.status(500).json({ error: { message: 'Failed to receive response from Cohere API', type: 'internal_server_error' } });
-
+ 
+      // If streaming is enabled, attempt to stream back chunks via Server-Sent Events (SSE).
+      if (streamingEnabled) {
+        // Set SSE headers
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+        // Prevent Express from buffering the response
+        if (typeof res.flushHeaders === 'function') res.flushHeaders();
+        // Send an initial comment to establish the stream
+        res.write(': ok\n\n');
+ 
+        let assistantResponse = '';
+        try {
+          // Async iterable (preferred)
+          if (response && typeof response[Symbol.asyncIterator] === 'function') {
+            for await (const chunk of response) {
+              let textChunk = '';
+              if (typeof chunk === 'string') {
+                textChunk = chunk;
+              } else if (chunk && typeof chunk === 'object') {
+                // Common shapes: { text }, { delta: { content } }, or SDK-specific tokens
+                if (typeof chunk.text === 'string') textChunk = chunk.text;
+                else if (chunk.delta && typeof chunk.delta.content === 'string') textChunk = chunk.delta.content;
+                else if (typeof chunk.content === 'string') textChunk = chunk.content;
+                else textChunk = JSON.stringify(chunk);
+              }
+              if (textChunk) {
+                assistantResponse += textChunk;
+                // Send chunk as SSE data event
+                res.write(`data: ${JSON.stringify({ text: textChunk })}\n\n`);
+              }
+            }
+            // Finalize stream
+            res.write('event: done\ndata: {}\n\n');
+            this.conversationManager.addMessage(effectiveSessionId, 'assistant', assistantResponse);
+            return res.end();
+          }
+ 
+          // Node-style stream (fallback)
+          if (response && typeof response.on === 'function') {
+            response.on('data', (chunk) => {
+              const s = chunk?.toString ? chunk.toString() : String(chunk || '');
+              if (s) {
+                assistantResponse += s;
+                res.write(`data: ${JSON.stringify({ text: s })}\n\n`);
+              }
+            });
+            response.on('end', () => {
+              res.write('event: done\ndata: {}\n\n');
+              this.conversationManager.addMessage(effectiveSessionId, 'assistant', assistantResponse);
+              res.end();
+            });
+            response.on('error', (e) => {
+              logger.error({ err: e }, 'Streaming response error');
+              res.write('event: error\ndata: {}\n\n');
+              res.end();
+            });
+            return;
+          }
+ 
+          // If the response isn't streamable, fall back to non-stream behavior below.
+        } catch (err) {
+          logger.error({ err }, 'Error while streaming response');
+          // Attempt to end the SSE connection gracefully
+          try { res.write('event: error\ndata: {}\n\n'); } catch (e) {}
+          try { res.end(); } catch (e) {}
+          return;
+        }
+      }
+ 
+      // Non-streaming response handling (existing behavior)
       const assistantResponse = response.text || '';
       this.conversationManager.addMessage(effectiveSessionId, 'assistant', assistantResponse);
-
+ 
       const completionResponse = this.formatChatResponse(response, model, conversationData, startTime, effectiveSessionId);
       res.json(completionResponse);
     } catch (err) {

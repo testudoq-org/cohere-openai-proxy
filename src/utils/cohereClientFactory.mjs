@@ -9,6 +9,27 @@ import { CohereClient } from 'cohere-ai';
 import { httpsAgent as defaultHttpsAgent, EXTERNAL_API_TIMEOUT_MS } from './httpAgent.mjs';
 import { retry } from './retry.mjs';
 import { SimpleCircuitBreaker } from './circuitBreaker.mjs';
+import LruTtlCache from './lruTtlCache.mjs';
+import promClient from 'prom-client';
+
+// Cohere request latency (seconds) and success/failure counters.
+// Labels: operation (e.g., chat), model (when available)
+const cohereRequestDuration = new promClient.Histogram({
+  name: 'cohere_request_duration_seconds',
+  help: 'Cohere API request duration in seconds',
+  buckets: [0.005, 0.01, 0.05, 0.1, 0.5, 1, 2, 5],
+  labelNames: ['operation', 'model']
+});
+const cohereRequestSuccess = new promClient.Counter({
+  name: 'cohere_request_success_total',
+  help: 'Cohere API successful requests',
+  labelNames: ['operation', 'model']
+});
+const cohereRequestFailure = new promClient.Counter({
+  name: 'cohere_request_failure_total',
+  help: 'Cohere API failed requests',
+  labelNames: ['operation', 'model']
+});
 
 /**
  * Create a Cohere client, trying common agent option names for SDK compatibility.
@@ -95,8 +116,19 @@ export async function createCohereClient({ token, agentOptions = defaultHttpsAge
     jitter: true,
   });
 
+  // Response-level cache for chat responses (TTL 2 minutes).
+  // Cache key is based on model, message, temperature, and max_tokens.
+  const responseCache = new LruTtlCache({ ttlMs: 2 * 60 * 1000, maxSize: 1000 });
+ 
+  // Feature flag: whether the underlying Cohere V2 client supports streaming.
+  const COHERE_V2_STREAMING_SUPPORTED = !!(
+    process.env.COHERE_V2_STREAMING_SUPPORTED &&
+    ['1', 'true', 'yes'].includes(String(process.env.COHERE_V2_STREAMING_SUPPORTED).toLowerCase())
+  );
+ 
   // Recursively wrap functions on the client so calls are proxied through circuit + retry.
-  const wrapValue = (value, ctx) => {
+  // `prop` is provided so we can special-case certain API calls (e.g., 'chat') for response caching.
+  const wrapValue = (value, ctx, prop) => {
     if (typeof value === 'function') {
       return function wrapped(...args) {
         // allow caller to pass an options object as last arg to override retry options for that call
@@ -118,14 +150,69 @@ export async function createCohereClient({ token, agentOptions = defaultHttpsAge
         }
         // If override was provided and it was the last argument, remove it from SDK args.
         const sdkArgs = overrideProvided ? args.slice(0, -1) : args;
-
+ 
         // Try a direct synchronous invocation first so that SDKs which return sync
         // values (e.g., mocked functions) remain synchronous for callers.
         try {
           const maybeResult = value.apply(ctx || rawClient, sdkArgs);
           if (maybeResult && typeof maybeResult.then === 'function') {
             // Async - go through circuit + retry
-            return circuit.exec(() => retry(() => value.apply(ctx || rawClient, sdkArgs), callOptions));
+            // Prepare callArgs; allow special-casing of the chat payload to inject streaming flag
+            let callArgsForAttempt = sdkArgs;
+            if (prop === 'chat' && sdkArgs[0] && typeof sdkArgs[0] === 'object') {
+              try {
+                const p = sdkArgs[0];
+                // Ensure we do not mutate caller objects
+                const callPayload = { ...p, ...(COHERE_V2_STREAMING_SUPPORTED ? { stream: true } : {}) };
+                callArgsForAttempt = [callPayload, ...sdkArgs.slice(1)];
+              } catch (e) {
+                // fallback to original args if anything goes wrong
+                callArgsForAttempt = sdkArgs;
+              }
+            }
+ 
+            const makeCall = async () => {
+              // Instrument overall call (includes retries) with Prometheus metrics.
+              // Determine labels where possible.
+              let modelLabel = '';
+              try {
+                const p = (prop === 'chat' && sdkArgs[0] && typeof sdkArgs[0] === 'object') ? sdkArgs[0] : (callArgsForAttempt && callArgsForAttempt[0] && typeof callArgsForAttempt[0] === 'object' ? callArgsForAttempt[0] : null);
+                modelLabel = (p && (p.model || p.modelName)) ? String(p.model || p.modelName) : getCohereModel();
+              } catch (e) {
+                modelLabel = getCohereModel();
+              }
+              const labels = { operation: String(prop), model: modelLabel };
+
+              const endTimer = cohereRequestDuration.startTimer(labels);
+              try {
+                const res = await circuit.exec(() => retry(() => value.apply(ctx || rawClient, callArgsForAttempt), callOptions));
+                try { cohereRequestSuccess.inc(labels); } catch (e) { /* ignore metric errors */ }
+                return res;
+              } catch (err) {
+                try { cohereRequestFailure.inc(labels); } catch (e) { /* ignore metric errors */ }
+                throw err;
+              } finally {
+                try { endTimer(); } catch (e) { /* ignore metric errors */ }
+              }
+            };
+ 
+            // If this looks like a chat call, attempt response-level caching.
+            if (prop === 'chat' && sdkArgs[0] && typeof sdkArgs[0] === 'object') {
+              try {
+                const p = sdkArgs[0];
+                const model = p.model || getCohereModel();
+                const message = typeof p.message === 'string' ? p.message : JSON.stringify(p.message || '');
+                const temperature = (typeof p.temperature !== 'undefined') ? String(p.temperature) : '';
+                const maxTokens = (typeof p.max_tokens !== 'undefined') ? String(p.max_tokens) : '';
+                const cacheKey = `cohere:chat:${model}|${message}|t=${temperature}|m=${maxTokens}`;
+                return responseCache.getOrSetAsync(cacheKey, makeCall);
+              } catch (e) {
+                // If cache key construction fails for any reason, fall back to making the call.
+                return makeCall();
+              }
+            }
+ 
+            return makeCall();
           }
           // Synchronous result - return directly
           return maybeResult;
@@ -140,7 +227,7 @@ export async function createCohereClient({ token, agentOptions = defaultHttpsAge
         get(target, prop) {
           // preserve some common non-enumerable things
           const v = target[prop];
-          return wrapValue(v, target);
+          return wrapValue(v, target, prop);
         },
         // pass-through for other traps
         has(target, prop) { return prop in target; },
@@ -152,7 +239,7 @@ export async function createCohereClient({ token, agentOptions = defaultHttpsAge
   const wrappedClient = new Proxy(rawClient, {
     get(target, prop) {
       const v = target[prop];
-      return wrapValue(v, target);
+      return wrapValue(v, target, prop);
     },
     // preserve ownKeys/has to keep introspection working
     has(target, prop) { return prop in target; },
@@ -164,4 +251,30 @@ export async function createCohereClient({ token, agentOptions = defaultHttpsAge
   });
 
   return { client: wrappedClient, acceptedAgentOption };
+}
+
+/**
+ * Convenience exported helper for profiling: callCohereChatAPI
+ * Accepts a wrapped client (from createCohereClient) or raw client-like object with a .chat method.
+ * This function provides a stable entrypoint that can be exercised under profiling tools
+ * (e.g., clinic.js) to identify hotspots in chat requests.
+ */
+export async function callCohereChatAPI(clientLike, payload, options) {
+  if (!clientLike || typeof clientLike.chat !== 'function') {
+    throw new Error('callCohereChatAPI requires a client with a .chat function');
+  }
+  // Measure via the same metrics for consistency.
+  const modelLabel = (payload && (payload.model)) ? String(payload.model) : getCohereModel();
+  const labels = { operation: 'chat', model: modelLabel };
+  const endTimer = cohereRequestDuration.startTimer(labels);
+  try {
+    const res = await clientLike.chat(payload, options);
+    try { cohereRequestSuccess.inc(labels); } catch (e) { /* ignore metric errors */ }
+    return res;
+  } catch (err) {
+    try { cohereRequestFailure.inc(labels); } catch (e) { /* ignore metric errors */ }
+    throw err;
+  } finally {
+    try { endTimer(); } catch (e) { /* ignore metric errors */ }
+  }
 }

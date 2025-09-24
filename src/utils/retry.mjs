@@ -1,3 +1,13 @@
+import promClient from 'prom-client';
+const retryAttemptsCounter = new promClient.Counter({
+  name: 'retry_attempts_total',
+  help: 'Total retry attempts scheduled'
+});
+const retryTimeoutsCounter = new promClient.Counter({
+  name: 'retry_timeouts_total',
+  help: 'Retry attempts that timed out'
+});
+
 export async function retry(fn, options = {}) {
   // Backwards-compat: callers may pass (fn, attempts, baseDelayMs, extras?)
   // so normalize arguments. Support an optional 4th arg with extra options
@@ -30,7 +40,7 @@ export async function retry(fn, options = {}) {
     maxDelayMs = 2000,
     // jitter: true (boolean) or (delay) => number
     jitter = true,
-    perAttemptTimeoutMs = 3000,
+    perAttemptTimeoutMs = 1500,
     // predicate to decide whether to retry given an error
     retryOn,
     // injectable helpers for testability
@@ -96,6 +106,11 @@ export async function retry(fn, options = {}) {
         throw lastErr;
       }
 
+      // record timeout metric when applicable
+      if (err && err.isTimeout) {
+        try { retryTimeoutsCounter.inc(); } catch (e) { /* ignore metric errors */ }
+      }
+
       // compute exponential backoff delay for attempt n (n starts at 1)
       const exp = Math.min(maxDelayMs, baseDelayMs * (2 ** (attempt - 1)));
 
@@ -114,6 +129,9 @@ export async function retry(fn, options = {}) {
 
       // ensure non-negative and clamp to maxDelayMs
       delay = Math.max(0, Math.min(delay, maxDelayMs));
+
+      // increment retry attempts metric for this scheduled retry
+      try { retryAttemptsCounter.inc(); } catch (e) { /* ignore metric errors */ }
 
       // wait before next attempt (use injected waitFn for test determinism)
       // small comment: using await ensures sequential retries

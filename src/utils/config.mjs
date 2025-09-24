@@ -1,0 +1,2 @@
+export const COHERE_V2_STREAMING_SUPPORTED = true;
+export const COHERE_V2_BATCHING_SUPPORTED = false;

@@ -19,6 +19,7 @@
   "dependencies": {
     "cohere-ai": "^7.17.1",
     "cors": "^2.8.5",
+    "compression": "^1.7.4",
     "dotenv": "^17.2.0",
     "express": "^5.1.0",
     "express-rate-limit": "^8.0.1",
