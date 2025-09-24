@@ -69,11 +69,23 @@ class ConversationManager {
   }
 
   formatRAGContext(ragDocuments) {
-    const contextSections = ragDocuments.map((doc, idx) => {
-      const m = doc.metadata;
-      return `## Relevant Code Context ${idx+1}\n**File**: ${m.filePath}\n**Type**: ${m.category} (${m.language})\n**Relevance**: ${(doc.relevanceScore||doc.score||0).toFixed? ( (doc.relevanceScore||doc.score||0)*100).toFixed(1) : 'n/a'}%\n\n\`\`\`${m.language}\n${doc.content}\n\`\`\``;
-    }).join('\n\n');
-    return `# Retrieved Codebase Context\n\n${contextSections}\n\nPlease use this context...`;
+    // Defensive formatting to avoid runtime errors when metadata or fields are missing.
+    if (!Array.isArray(ragDocuments) || ragDocuments.length === 0) return '';
+    const sections = [];
+    for (let idx = 0; idx < ragDocuments.length; idx++) {
+      const doc = ragDocuments[idx] || {};
+      const m = doc.metadata || {};
+      const filePath = m.filePath || m.file || 'unknown';
+      const language = m.language || 'text';
+      const category = m.category || 'unknown';
+      const rawScore = (typeof doc.relevanceScore !== 'undefined') ? doc.relevanceScore : (typeof doc.score !== 'undefined' ? doc.score : 0);
+      const relevancePct = (typeof rawScore === 'number' && Number.isFinite(rawScore)) ? `${(rawScore * 100).toFixed(1)}%` : 'n/a';
+      const content = String(doc.content || '').trim() || '(no content)';
+      sections.push(
+        `## Relevant Code Context ${idx + 1}\n**File**: ${filePath}\n**Type**: ${category} (${language})\n**Relevance**: ${relevancePct}\n\n\`\`\`${language}\n${content}\n\`\`\``
+      );
+    }
+    return `# Retrieved Codebase Context\n\n${sections.join('\n\n')}\n\nPlease use this context...`;
   }
 
   buildEnhancedPreamble(originalPreamble, ragContext) {

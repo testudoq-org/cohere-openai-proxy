@@ -26,6 +26,16 @@ class LruTtlCache {
     return `rerank:${model}:${JSON.stringify(query)}:${JSON.stringify(docs)}`;
   }
 
+  /**
+   * Helper to build a stable vision cache key.
+   * model: string model id
+   * input: string (base64 image) or array of images
+   */
+  static makeVisionKey(model, input) {
+    const arr = Array.isArray(input) ? input : [input];
+    return `vision:${model}:${arr.map(i => typeof i === 'string' ? i.slice(0, 32) : '').join('|')}`;
+  }
+
   _now() { return Date.now(); }
 
   get(key) {
