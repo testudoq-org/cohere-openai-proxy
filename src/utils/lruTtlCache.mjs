@@ -30,6 +30,37 @@ class LruTtlCache {
 
   delete(key) { this.map.delete(key); }
   clear() { this.map.clear(); }
+
+  /**
+   * Helper to atomically get a cached value or compute & cache an async value.
+   * If a concurrent caller triggers the same key, the in-flight promise is cached
+   * so only a single upstream request will be performed.
+   *
+   * Usage:
+   *   const result = await cache.getOrSetAsync(key, () => fetchSomething());
+   */
+  async getOrSetAsync(key, asyncFn) {
+    const existing = this.get(key);
+    if (typeof existing !== 'undefined') return existing;
+
+    // Create a promise and insert immediately to prevent duplicate concurrent calls.
+    const p = (async () => {
+      try {
+        const res = await asyncFn();
+        // replace stored promise with the resolved value (preserve TTL)
+        this.set(key, res);
+        return res;
+      } catch (err) {
+        // remove failed promise so subsequent calls may retry
+        this.delete(key);
+        throw err;
+      }
+    })();
+
+    // store the in-flight promise with TTL so other callers reuse it
+    this.set(key, p);
+    return p;
+  }
 }
 
 export default LruTtlCache;
