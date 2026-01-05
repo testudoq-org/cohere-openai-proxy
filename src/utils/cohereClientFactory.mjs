@@ -33,6 +33,12 @@ const cohereRequestFailure = new promClient.Counter({
   labelNames: ['operation', 'model']
 });
 
+// Global cooldown state to temporarily pause calls when sustained 429s are observed.
+let chatGlobalCooldownUntil = 0;
+let embedGlobalCooldownUntil = 0;
+const CHAT_COOLDOWN_MS = Number(process.env.CHAT_COOLDOWN_MS) || 60 * 1000; // default 60s
+const EMBED_COOLDOWN_MS = Number(process.env.EMBED_COOLDOWN_MS) || 60 * 1000; // default 60s
+
 /**
  * Create a Cohere client, trying common agent option names for SDK compatibility.
  *
@@ -47,7 +53,7 @@ const cohereRequestFailure = new promClient.Counter({
  * @param {object} [params.logger=console] - logger with .warn available
  * @returns {Promise<{client: any, acceptedAgentOption: 'agent'|'httpsAgent'|'none'}>}
  */
-export async function createCohereClient({ token, agentOptions = defaultHttpsAgent, logger = console, model } = {}) {
+export async function createCohereClient({ token, agentOptions = defaultHttpsAgent, logger = console, model, embedAgent = null, routeEmbeddingsViaAgent = false } = {}) {
   // Fail fast if token missing
   if (!token) {
     throw new Error('Cohere client creation requires a token');
@@ -121,13 +127,25 @@ export async function createCohereClient({ token, agentOptions = defaultHttpsAge
   const circuit = new SimpleCircuitBreaker({ failureThreshold: cbFailures, resetTimeoutMs: cbReset });
 
   // Default retry options sourced from environment (caller may override by passing options obj later if needed)
-  const defaultRetryOptions = () => ({
-    maxAttempts: Number(process.env.EXTERNAL_API_MAX_ATTEMPTS) || 3,
-    baseDelayMs: Number(process.env.EXTERNAL_API_BASE_DELAY_MS) || 200,
-    perAttemptTimeoutMs: Number(process.env.EXTERNAL_API_TIMEOUT_MS) || EXTERNAL_API_TIMEOUT_MS,
-    maxDelayMs: 2000,
-    jitter: true,
-  });
+  const defaultRetryOptions = (prop) => {
+    // Allow more conservative/frequent retries for embed calls which are commonly rate-limited.
+    if (prop === 'embed') {
+      return {
+        maxAttempts: Number(process.env.EXTERNAL_API_MAX_ATTEMPTS_EMBED) || 6,
+        baseDelayMs: Number(process.env.EXTERNAL_API_BASE_DELAY_MS) || 200,
+        perAttemptTimeoutMs: Number(process.env.EXTERNAL_API_TIMEOUT_MS) || EXTERNAL_API_TIMEOUT_MS,
+        maxDelayMs: 5000,
+        jitter: true,
+      };
+    }
+    return {
+      maxAttempts: Number(process.env.EXTERNAL_API_MAX_ATTEMPTS) || 3,
+      baseDelayMs: Number(process.env.EXTERNAL_API_BASE_DELAY_MS) || 200,
+      perAttemptTimeoutMs: Number(process.env.EXTERNAL_API_TIMEOUT_MS) || EXTERNAL_API_TIMEOUT_MS,
+      maxDelayMs: 2000,
+      jitter: true,
+    };
+  };
 
   // Response-level cache for chat responses (TTL 2 minutes).
   // Cache key is based on model, message, temperature, and max_tokens.
@@ -146,7 +164,7 @@ export async function createCohereClient({ token, agentOptions = defaultHttpsAge
       return function wrapped(...args) {
         // allow caller to pass an options object as last arg to override retry options for that call
         const lastArg = args[args.length - 1];
-        let callOptions = defaultRetryOptions();
+        let callOptions = defaultRetryOptions(prop);
         let overrideProvided = false;
         if (lastArg && typeof lastArg === 'object' && (lastArg.maxAttempts || lastArg.baseDelayMs || lastArg.perAttemptTimeoutMs)) {
           // shallow pick known retry props and remove from args for actual SDK call
@@ -198,17 +216,76 @@ export async function createCohereClient({ token, agentOptions = defaultHttpsAge
 
               const endTimer = cohereRequestDuration.startTimer(labels);
               try {
-                const res = await circuit.exec(() => retry(() => value.apply(ctx || rawClient, callArgsForAttempt), callOptions));
+                // Allow embedding calls to be routed through a dedicated agent by constructing
+                // a short-lived client with the provided embedAgent. Fall back to the
+                // wrapped rawClient if construction fails or flag not set.
+                let executeFn = () => value.apply(ctx || rawClient, callArgsForAttempt);
+                if (prop === 'embed' && routeEmbeddingsViaAgent && embedAgent) {
+                  executeFn = async () => {
+                    try {
+                      try {
+                        const tmp = await tryConstruct({ token, apiVersion: 'v2', agent: embedAgent });
+                        if (tmp && typeof tmp.embed === 'function') return tmp.embed(...callArgsForAttempt);
+                      } catch (e) { /* ignore */ }
+                      try {
+                        const tmp = await tryConstruct({ token, apiVersion: 'v2', httpsAgent: embedAgent });
+                        if (tmp && typeof tmp.embed === 'function') return tmp.embed(...callArgsForAttempt);
+                      } catch (e) { /* ignore */ }
+                      return value.apply(ctx || rawClient, callArgsForAttempt);
+                    } catch (e) {
+                      return value.apply(ctx || rawClient, callArgsForAttempt);
+                    }
+                  };
+                }
+
+                // If chat/embed-level cooldown is active, pause before attempting to call the upstream API.
+                if ((prop === 'chat' && typeof chatGlobalCooldownUntil === 'number' && Date.now() < chatGlobalCooldownUntil) ||
+                    (prop === 'embed' && typeof embedGlobalCooldownUntil === 'number' && Date.now() < embedGlobalCooldownUntil)) {
+                  const now = Date.now();
+                  const waitMs = prop === 'chat' ? Math.max(0, chatGlobalCooldownUntil - now) : Math.max(0, embedGlobalCooldownUntil - now);
+                  try { logger?.warn?.(`${prop} requests paused for ${waitMs}ms due to upstream rate limiting`); } catch (e) {}
+                  await new Promise((r) => setTimeout(r, waitMs));
+                }
+
+                const res = await circuit.exec(() => retry(() => executeFn(), callOptions));
                 try { cohereRequestSuccess.inc(labels); } catch (e) { /* ignore metric errors */ }
                 return res;
               } catch (err) {
                 try { cohereRequestFailure.inc(labels); } catch (e) { /* ignore metric errors */ }
+
+                // If we observe a 429 from Cohere for chat/embed calls, set a global cooldown.
+                try {
+                  const status = err?.status || err?.statusCode;
+                  if (status === 429) {
+                    // Attempt to read Retry-After header from various shapes
+                    const headers = err.headers || err.response?.headers || err.raw?.headers || (err?.body && err.body.headers) || {};
+                    const ra = headers && (headers['retry-after'] || headers['Retry-After']);
+                    let until = Date.now() + (prop === 'embed' ? EMBED_COOLDOWN_MS : CHAT_COOLDOWN_MS);
+                    if (ra) {
+                      const secs = Number(ra);
+                      if (!Number.isNaN(secs)) {
+                        until = Date.now() + secs * 1000;
+                      } else {
+                        const parsed = Date.parse(String(ra));
+                        if (!Number.isNaN(parsed)) until = parsed;
+                      }
+                    }
+                    if (prop === 'embed') {
+                      embedGlobalCooldownUntil = Math.max(embedGlobalCooldownUntil || 0, until);
+                      try { logger?.warn?.(`Observed embed 429 — setting cooldown until ${new Date(embedGlobalCooldownUntil).toISOString()}`); } catch (e) {}
+                    } else {
+                      chatGlobalCooldownUntil = Math.max(chatGlobalCooldownUntil || 0, until);
+                      try { logger?.warn?.(`Observed chat 429 — setting cooldown until ${new Date(chatGlobalCooldownUntil).toISOString()}`); } catch (e) {}
+                    }
+                  }
+                } catch (parseErr) { /* ignore */ }
+
                 throw err;
               } finally {
                 try { endTimer(); } catch (e) { /* ignore metric errors */ }
               }
             };
- 
+
             // If this looks like a chat call, attempt response-level caching.
             if (prop === 'chat' && sdkArgs[0] && typeof sdkArgs[0] === 'object') {
               try {
@@ -224,7 +301,7 @@ export async function createCohereClient({ token, agentOptions = defaultHttpsAge
                 return makeCall();
               }
             }
- 
+
             return makeCall();
           }
           // Synchronous result - return directly
@@ -337,7 +414,7 @@ export async function callCohereChatAPI(clientLike, payload, options) {
     throw new Error('callCohereChatAPI requires a client with a .chat function');
   }
   // Measure via the same metrics for consistency.
-  const modelLabel = (payload && (payload.model)) ? String(payload.model) : getCohereModel();
+  const modelLabel = (payload && payload.model) ? String(payload.model) : getCohereModel();
   const labels = { operation: 'chat', model: modelLabel };
   const endTimer = cohereRequestDuration.startTimer(labels);
   try {

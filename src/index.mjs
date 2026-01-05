@@ -43,6 +43,16 @@ const __dirname = path.dirname(__filename);
 
 const logger = Pino({ level: process.env.LOG_LEVEL || 'info' });
 
+// Global safety: catch unhandled rejections and uncaught exceptions to prevent the
+// server from exiting due to third-party SDK runtime errors. Log and continue.
+process.on('unhandledRejection', (reason, promise) => {
+  try { logger.error({ err: String(reason) }, 'Unhandled promise rejection'); } catch (e) { console.error('Unhandled promise rejection', reason); }
+});
+process.on('uncaughtException', (err) => {
+  try { logger.fatal({ err: err?.message || String(err), stack: err?.stack }, 'Uncaught exception'); } catch (e) { console.error('Uncaught exception', err); }
+  // Do not exit; keep process alive for debugging. In production consider exiting and restarting.
+});
+
 const { client: _defaultCohereClient, acceptedAgentOption: _defaultCohereAcceptedAgentOption } = await createCohereClient({ token: process.env.COHERE_API_KEY, agentOptions: httpsAgent, logger });
 console.log('[startup debug] Cohere client creation result:', {
   clientCreated: !!_defaultCohereClient,
@@ -161,7 +171,24 @@ class EnhancedCohereRAGServer {
     this.app.use(limiter);
 
     this.app.use(cors({ origin: process.env.ALLOWED_ORIGINS?.split(',') || '*' }));
-    this.app.use(express.json({ limit: '10mb' }));
+
+    // Capture raw request bodies for diagnostics when RooCode user-agent or explicit env flag set.
+    // Use the `verify` hook so express.json still parses the body.
+    this.app.use(express.json({
+      limit: '10mb',
+      verify: (req, res, buf) => {
+        try {
+          const ua = String(req.headers['user-agent'] || '').toLowerCase();
+          if (ua.includes('roocode') || (!DIAGNOSTICS_DISABLED && process.env.LOG_ALL_RAW_BODIES === '1')) {
+            req.rawBody = buf.toString('utf8');
+            // Emit both structured debug (if logger supports) and plain console output so local RooCode CLI sees it.
+            try { logger.debug?.({ rawBody: req.rawBody.slice(0, 2000), userAgent: req.headers['user-agent'] }, 'raw body capture'); } catch (e) {}
+            try { console.log('[raw-body-capture]', req.headers['x-trace-id'] || req.traceId || '', String(req.headers['user-agent'] || '').slice(0,80), '->', req.rawBody.slice(0,2000)); } catch (e) {}
+          }
+        } catch (e) { /* ignore */ }
+      }
+    }));
+
     this.app.use(express.urlencoded({ extended: true }));
   }
 
@@ -244,7 +271,8 @@ class EnhancedCohereRAGServer {
           if (model && typeof model === "string" && model.includes("v3.0")) {
             payload.input_type = "search_document";
           }
-          const resp = await this.cohere.embed(payload);
+          const embeddingQueue = (await import('./services/embeddingQueue.mjs')).default;
+          const resp = await embeddingQueue.enqueueEmbedding({ input: payload, options: { model, logger } });
           return resp;
         };
 
@@ -312,7 +340,8 @@ class EnhancedCohereRAGServer {
     });
 
     // existing chat + rag + conversation routes
-    this.app.post('/v1/chat/completions', this.handleChatCompletion.bind(this));
+    // Backwards-compatible alias: accept client requests without /v1 prefix
+    this.app.post(['/chat/completions', '/v1/chat/completions'], this.handleChatCompletion.bind(this));
     this.setupRAGRoutes();
     this.setupConversationRoutes();
 
@@ -537,8 +566,9 @@ class EnhancedCohereRAGServer {
     if (conversationData.preamble) payload.preamble = conversationData.preamble;
 
     logger.info({ model, payloadKeys: Object.keys(payload), messageLength: conversationData.message?.length }, 'Preparing Cohere API call');
-
+    // Diagnostic: log full payload shape when debugging chat failures
     try {
+      try { logger.debug?.({ payload }, 'Cohere payload debug'); } catch (e) { console.error('payload debug', payload); }
       const sent = nowMs();
       if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:call:start', model, payloadSizeChars: String(JSON.stringify(payload).length), start: sent });
 

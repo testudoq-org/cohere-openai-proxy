@@ -1,4 +1,22 @@
-import { it, describe, expect, beforeEach, afterEach } from 'vitest';
+import { it, describe, expect, beforeEach, afterEach, vi } from 'vitest';
+// Mock embeddingQueue to avoid real Cohere client creation during embedding worker tests
+vi.doMock('../src/services/embeddingQueue.mjs', () => ({
+  default: {
+    enqueueEmbedding: async ({ input }) => {
+      // normalize input to texts array
+      const texts = Array.isArray(input)
+        ? input
+        : input && Array.isArray(input.texts)
+          ? input.texts
+          : input && input.text
+            ? [input.text]
+            : [];
+      const embeddings = texts.map(() => [9,9,9]);
+      return { body: { embeddings } };
+    }
+  }
+}), { virtual: true });
+
 import RAGDocumentManager from '../src/ragDocumentManager.mjs';
 import fsSync from 'fs';
 import path from 'path';

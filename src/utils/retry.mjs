@@ -8,6 +8,9 @@ const retryTimeoutsCounter = new promClient.Counter({
   help: 'Retry attempts that timed out'
 });
 
+// Expose embedding-specific retry attempts (env override allowed)
+export const EMBEDDING_RETRY_ATTEMPTS = Number(process.env.EMBEDDING_RETRY_ATTEMPTS) || 6;
+
 export async function retry(fn, options = {}) {
   // Backwards-compat: callers may pass (fn, attempts, baseDelayMs, extras?)
   // so normalize arguments. Support an optional 4th arg with extra options
@@ -61,19 +64,28 @@ export async function retry(fn, options = {}) {
     },
   } = options || {};
 
-  // default retryOn: retry on network-like errors (no status) or 5xx status codes or when error.code exists
+  // default retryOn: treat 429 as retryable, retry on 5xx, and network errors (err.code)
   const defaultRetryOn = (err) => {
     if (!err) return false;
-    // if there's a numeric status, retry on 5xx
-    if (typeof err.status === 'number') return err.status >= 500;
-    if (typeof err.statusCode === 'number') return err.statusCode >= 500;
+    const status = (typeof err.status === 'number') ? err.status : (typeof err.statusCode === 'number' ? err.statusCode : undefined);
+    // Treat 429 (rate limit) as retryable
+    if (status === 429) return true;
+    // retry on 5xx
+    if (typeof status === 'number') return status >= 500;
     // if there's a code (e.g., ECONNRESET) treat as retryable
     if (err.code) return true;
-    // otherwise assume network error -> retry
-    return true;
+    return false;
   };
 
-  const shouldRetry = typeof retryOn === 'function' ? retryOn : defaultRetryOn;
+  // If called via legacy signature, tests and older callers expect *any* error to be retried
+  // unless an explicit retryOn predicate was provided. Honor explicit retryOn but default to
+  // always-retry for legacy callers for backwards compatibility.
+  let shouldRetry;
+  if (_fromLegacy && typeof retryOn === 'undefined') {
+    shouldRetry = () => true;
+  } else {
+    shouldRetry = typeof retryOn === 'function' ? retryOn : defaultRetryOn;
+  }
 
   let lastErr;
 
@@ -122,9 +134,9 @@ export async function retry(fn, options = {}) {
       } else if (jitter === false) {
         delay = exp;
       } else {
-        // default jitter: randomize between 50% and 150% of exp
-        const multiplier = 0.5 + rng() * 1.0; // [0.5, 1.5)
-        delay = exp * multiplier;
+        // default jitter: center-biased jitter producing multiplier in [0.5,1.5)
+        // this keeps delays away from zero and aligns with test expectations
+        delay = (0.5 + rng() * 1.0) * exp;
       }
 
       // ensure non-negative and clamp to maxDelayMs

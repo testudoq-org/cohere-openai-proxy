@@ -18,7 +18,7 @@ class RAGDocumentManager {
     this.indexingQueue = [];
     this.indexing = false;
   // Embedding batching/queue config (tunable via env)
-  this.embeddingModel = process.env.COHERE_EMBEDDING_MODEL || 'small';
+  this.embeddingModel = process.env.COHERE_EMBEDDING_MODEL || 'embed-english-v3.0';
   this.maxEmbeddingBatch = Number(process.env.MAX_EMBEDDING_BATCH) || 24;
   this.embeddingQueue = []; // items: { key, text }
   this.embeddingWorkerRunning = false;
@@ -126,8 +126,9 @@ class RAGDocumentManager {
         this.metrics.embeddingRequests += 1;
         if (!this._diagDisabled) this.logger.info({ batchSize: batch.length, lengths: texts.map(t => (t||'').length) }, 'embedding:batch:start');
         const batchStart = Date.now();
-        const resp = await this._callEmbedApi(texts);
-        const embeddings = resp?.body?.embeddings ?? resp?.embeddings ?? resp;
+      const embeddingQueue = (await import('./services/embeddingQueue.mjs')).default;
+      const resp = await embeddingQueue.enqueueEmbedding({ input: { texts, model: this.embeddingModel, ...(this.embeddingModel && this.embeddingModel.includes('v3.0') ? { input_type: 'search_document' } : {}) }, options: { model: this.embeddingModel, logger: this.logger } });
+      const embeddings = resp?.body?.embeddings ?? resp?.embeddings ?? resp;
         if (!Array.isArray(embeddings) || embeddings.length !== texts.length) {
           this.logger.warn({ received: Array.isArray(embeddings) ? embeddings.length : typeof embeddings }, 'Unexpected embedding response shape');
           this.metrics.embeddingFailures += 1;
@@ -169,7 +170,8 @@ class RAGDocumentManager {
       try {
         const payload = { model: this.embeddingModel, texts };
         if (!this._diagDisabled) this.logger.info({ attempt, batchSize: texts.length, payloadSizeChars: String(JSON.stringify(payload).length) }, 'embedding:api:call');
-        const resp = await this.cohere.embed(payload);
+        const embeddingQueue = (await import('./services/embeddingQueue.mjs')).default;
+        const resp = await embeddingQueue.enqueueEmbedding({ input: payload, options: { model: this.embeddingModel, logger: this.logger } });
         const embeddings = resp?.body?.embeddings ?? resp?.embeddings ?? resp;
         if (!embeddings) throw new Error('No embeddings in response');
         if (!this._diagDisabled) this.logger.info({ attempt, batchSize: texts.length, durationMs: Date.now() - start }, 'embedding:api:success');
@@ -439,13 +441,14 @@ class RAGDocumentManager {
   }
 
   async getEmbedding(text) {
-    // Backwards compatible single-call helper: will try immediate call on cache miss
+    // Backwards compatible single-call helper: now routed through embeddingQueue
     const key = crypto.createHash('md5').update(text).digest('hex');
     const cached = this.embeddingCache.get(key);
     if (cached) return cached;
     try {
-      const resp = await this._callEmbedApi([text]);
-      const emb = resp.body?.embeddings?.[0] ?? null;
+      const embeddingQueue = (await import('./services/embeddingQueue.mjs')).default;
+      const resp = await embeddingQueue.enqueueEmbedding({ input: [text], options: { model: this.embeddingModel, logger: this.logger } });
+      const emb = resp.body?.embeddings?.[0] ?? resp?.embeddings?.[0] ?? null;
       if (emb) this.embeddingCache.set(key, emb);
       return emb;
     } catch (err) {

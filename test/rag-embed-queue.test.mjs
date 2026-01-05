@@ -5,8 +5,11 @@ import LruTtlCache from '../src/utils/lruTtlCache.mjs';
 describe('RAGDocumentManager embedding queue', () => {
   let fakeCohere;
   let mgr;
+  let queueCalls;
 
   beforeEach(() => {
+    queueCalls = [];
+
     fakeCohere = {
       // record last payloads
       _calls: [],
@@ -17,6 +20,19 @@ describe('RAGDocumentManager embedding queue', () => {
         return { body: { embeddings } };
       },
     };
+
+    // Ensure RAGDocumentManager uses a deterministic, fast embeddingQueue in tests
+    vi.doMock('../src/services/embeddingQueue.mjs', () => ({
+      default: {
+        enqueueEmbedding: async ({ input }) => {
+          const texts = input?.texts || (Array.isArray(input) ? input : (input?.text ? [input.text] : [])) || [];
+          queueCalls.push(texts);
+          const embeddings = texts.map(() => [0.1, 0.2, 0.3]);
+          return { body: { embeddings } };
+        }
+      }
+    }), { virtual: true });
+
     mgr = new RAGDocumentManager(fakeCohere, { logger: { warn: () => {}, info: () => {}, error: () => {} } });
     // speed up worker delays for test
     mgr.maxEmbeddingBatch = 3;
@@ -45,10 +61,10 @@ describe('RAGDocumentManager embedding queue', () => {
       expect(emb.length).toBe(3);
     }
 
-    // verify cohere client was called at least twice
-    expect(fakeCohere._calls.length).toBeGreaterThanOrEqual(2);
+    // verify embeddingQueue was called at least twice (two batches)
+    expect(queueCalls.length).toBeGreaterThanOrEqual(2);
     // verify batch sizes
-    const sizes = fakeCohere._calls.map(c => (c.texts || c.text || []).length);
+    const sizes = queueCalls.map(c => c.length);
     expect(sizes.reduce((a,b)=>a+b,0)).toBe(5);
   });
 });

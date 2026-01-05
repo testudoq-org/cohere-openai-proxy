@@ -29,6 +29,24 @@ export const httpsAgent = new https.Agent({
   timeout: AGENT_TIMEOUT_MS
 });
 
+/**
+ * Create a low-concurrency agent suitable for embedding requests where
+ * we want to limit outbound sockets to reduce likelihood of upstream
+ * rate limiting. Defaults are conservative and can be overridden.
+ *
+ * @param {object} opts
+ * @param {boolean} opts.useHttps - return https.Agent (true) or http.Agent (false)
+ * @param {number} opts.maxSockets
+ * @param {number} opts.maxFreeSockets
+ * @param {number} opts.timeout
+ */
+export function createLowConcurrencyAgent({ useHttps = true, maxSockets = 5, maxFreeSockets = 2, timeout = AGENT_TIMEOUT_MS } = {}) {
+  if (useHttps) {
+    return new https.Agent({ keepAlive: true, maxSockets, maxFreeSockets, timeout });
+  }
+  return new http.Agent({ keepAlive: true, maxSockets, maxFreeSockets, timeout });
+}
+
 // --- DNS cache implementation (simple, in-process) ---
 export const DNS_CACHE_TTL_MS = Number(process.env.DNS_CACHE_TTL_MS) || 10 * 60 * 1000; // 10m default
 const dnsCache = new Map(); // key -> { address, family, expiresAt }

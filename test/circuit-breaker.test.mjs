@@ -1,8 +1,13 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { retry } from '../src/utils/retry.mjs';
 import { SimpleCircuitBreaker } from '../src/utils/circuitBreaker.mjs';
+import promClient from 'prom-client';
 
 describe('retry', () => {
+  beforeEach(() => {
+    // Reset prom-client registry to avoid metric registration errors between tests
+    promClient.register.clear();
+  });
   it('retries and succeeds', async () => {
     let i = 0;
     const fn = async () => {

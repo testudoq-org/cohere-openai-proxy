@@ -1,5 +1,14 @@
-import { it, expect, vi } from 'vitest';
+import { it, expect, vi, beforeEach } from 'vitest';
 import { retry } from '../../src/utils/retry.mjs';
+import promClient from 'prom-client';
+
+beforeEach(() => {
+  // Reset prom-client registry to avoid metric registration errors between tests
+  promClient.register.clear();
+});
+
+// helper default retryOn for tests
+const alwaysRetry = () => true;
 
 // Test 1: exponential backoff increases delays (no jitter)
 it('uses exponential backoff without jitter (increasing delays)', async () => {
@@ -23,6 +32,7 @@ it('uses exponential backoff without jitter (increasing delays)', async () => {
     maxDelayMs: 10000,
     jitter: false,
     waitFn,
+    retryOn: alwaysRetry,
   });
 
   expect(res).toBe('ok');
@@ -57,6 +67,7 @@ it('applies jitter within expected bounds', async () => {
     jitter: true,
     rng,
     waitFn,
+    retryOn: alwaysRetry,
   });
 
   expect(res).toBe('done');
@@ -101,6 +112,7 @@ it('retries when per-attempt timeout occurs', async () => {
     jitter: false,
     waitFn,
     timeoutFactory,
+    retryOn: alwaysRetry,
   });
 
   // allow microtasks to flush so the rejected promises propagate
@@ -128,7 +140,7 @@ it('supports legacy signature retry(fn, attempts, baseDelayMs)', async () => {
   };
 
   // legacy signature: retry(fn, attempts, baseDelayMs, extras)
-  const p = retry(fn, 3, 200, { waitFn });
+  const p = retry(fn, 3, 200, { waitFn, retryOn: alwaysRetry });
 
   // allow microtasks to run so retries complete quickly
   await Promise.resolve();

@@ -1,4 +1,4 @@
-import { it, describe, expect, beforeEach, afterEach } from 'vitest';
+import { it, describe, expect, beforeEach, afterEach, vi } from 'vitest';
 import RAGDocumentManager from '../src/ragDocumentManager.mjs';
 import fs from 'fs/promises';
 import fsSync from 'fs';
@@ -11,6 +11,17 @@ describe('RAGDocumentManager embeddings persistence', () => {
   afterEach(async () => { if (fsSync.existsSync(TMP_EMB_DIR)) fsSync.rmSync(TMP_EMB_DIR, { recursive: true, force: true }); });
 
   it('persists embeddings to ndjson and loads them back', async () => {
+    // Mock embeddingQueue to avoid creating real Cohere client in worker
+    vi.doMock('../src/services/embeddingQueue.mjs', () => ({
+      default: {
+        enqueueEmbedding: async ({ input }) => {
+          const texts = input && (Array.isArray(input.texts) ? input.texts : (Array.isArray(input) ? input : []));
+          const arr = Array.isArray(texts) ? texts : [];
+          return { body: { embeddings: arr.map(() => [1, 2, 3]) } };
+        }
+      }
+    }), { virtual: true });
+
     const calls = [];
     const fakeCohere = {
       embed: async ({ texts }) => {
