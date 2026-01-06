@@ -400,6 +400,14 @@ export async function callCohereChatAPI(clientLike, payload, options) {
     try { cohereRequestSuccess.inc(labels); } catch (e) { /* ignore metric errors */ }
     return res;
   } catch (err) {
+    // Special-case: surface clear deprecation error on status 420 (used by some Cohere infra to indicate deprecated endpoints)
+    const statusCode = err?.status || err?.statusCode || err?.status_code || err?.response?.status;
+    if (statusCode === 420) {
+      try { console.warn('Cohere API returned 420 - deprecated endpoint detected'); } catch (e) { /* ignore */ }
+      const deprec = new Error('Cohere API returned deprecated endpoint response (420). This endpoint appears to be removed; update to the Chat API.');
+      deprec.statusCode = 420;
+      throw deprec;
+    }
     try { cohereRequestFailure.inc(labels); } catch (e) { /* ignore metric errors */ }
     throw err;
   } finally {

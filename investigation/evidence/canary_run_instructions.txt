@@ -1,0 +1,35 @@
+# Canary Run Instructions
+
+1. Export recommended env vars:
+   - Windows (PowerShell):
+     $env:GLOBAL_RATE_LIMIT_PER_MIN = "30"
+     $env:COHERE_API_KEY = "<REDACTED>"
+     $env:PORT = "3000"
+
+   - Unix/bash:
+     export GLOBAL_RATE_LIMIT_PER_MIN=30
+     export COHERE_API_KEY="<REDACTED>"
+     export PORT=3000
+
+2. Start server (foreground) for canary:
+   npm run start
+   # OR to run directly with node and enable tracing/sourcemaps:
+   node --enable-source-maps --trace-warnings src/index.mjs
+
+3. Recommended process manager (pm2) example (do NOT start automatically):
+   npm install -g pm2
+   pm2 start --name cohere-proxy --interpreter node -- node --enable-source-maps --trace-warnings src/index.mjs --env production
+
+4. Tail logs and metrics:
+   - pm2 logs cohere-proxy --lines 200
+   - tail -f /var/log/cohere-proxy/* (adjust for your hosting environment)
+   - Query Prometheus endpoint if exposed: http://localhost:PORT/metrics
+
+5. Load test guidance to exercise rate limiting:
+   - Use a simple loop to send many chat requests (example):
+     for i in {1..100}; do curl -s -X POST http://localhost:3000/v1/chat/completions -H "Authorization: Bearer $COHERE_API_KEY" -H "Content-Type: application/json" -d '{"model":"command-a-vision-07-2025","message":"test"}'; done
+
+6. Notes:
+   - Replace <REDACTED> with your actual API key; do NOT store secrets in repo files.
+   - Monitor metrics for 'rate_limit_hits_total' and 'cohere_actual_rpm'.
+   - To stop pm2 process: pm2 stop cohere-proxy && pm2 delete cohere-proxy

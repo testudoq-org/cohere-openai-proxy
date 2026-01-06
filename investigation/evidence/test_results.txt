@@ -1,0 +1,12 @@
+(See captured npm test --silent output)
+
+--- Begin test output ---
+(Truncated) 131 tests passed across 30 files. See full test run in CI logs.
+
+Summary:
+Test Files: 30 passed
+Tests: 131 passed
+Start: 07:47:03
+Duration: 8.03s
+
+--- End test output ---

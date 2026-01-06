@@ -518,9 +518,9 @@ class EnhancedCohereRAGServer {
       }
  
       // Non-streaming response handling (existing behavior)
-      const assistantResponse = response.text || '';
+      const assistantResponse = this.extractResponseText(response) || '';
       this.conversationManager.addMessage(effectiveSessionId, 'assistant', assistantResponse);
- 
+
       const completionResponse = this.formatChatResponse(response, model, conversationData, startTime, effectiveSessionId);
       res.json(completionResponse);
     } catch (err) {
@@ -537,6 +537,22 @@ class EnhancedCohereRAGServer {
       try { return JSON.stringify(content); } catch (e) { return String(content); }
     }
     return String(content || '');
+  }
+
+  // Normalize various Cohere SDK response shapes to a single text string.
+  // Preference order: response.message?.content -> response.text -> response.generations?.[0]?.text
+  extractResponseText(response) {
+    if (!response) return '';
+    // Prefer message.content (Chat API shape)
+    const msg = response?.message?.content ?? response?.body?.message?.content;
+    if (msg) return (typeof msg === 'string') ? msg : this.extractContentString(msg);
+    // Fallback to top-level text (older SDK behavior)
+    if (typeof response.text === 'string') return response.text;
+    if (typeof response?.body?.text === 'string') return response.body.text;
+    // Fallback to generations array (Generate API old shape)
+    const genText = response?.generations?.[0]?.text ?? response?.body?.generations?.[0]?.text;
+    if (typeof genText === 'string') return genText;
+    return '';
   }
 
   async callCohereChatAPI(model, conversationData, temperature, maxTokens) {
@@ -578,7 +594,7 @@ class EnhancedCohereRAGServer {
   }
 
   formatChatResponse(response, model, conversationData, startTime, sessionId) {
-    const generatedText = response.text || '';
+    const generatedText = this.extractResponseText(response) || '';
     const processingTime = Date.now() - startTime;
     const promptTokens = this.estimateTokens(conversationData.message) + (conversationData.chatHistory?.length * 10 || 0);
     const completionTokens = this.estimateTokens(generatedText);
