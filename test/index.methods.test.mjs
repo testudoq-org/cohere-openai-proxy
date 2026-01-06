@@ -74,7 +74,7 @@ describe('EnhancedCohereRAGServer methods', () => {
 
     // Mock request/response
     const req = {
-      body: { messages: [{ role: 'user', content: 'test' }], model: 'command-a-03-2025' },
+      body: { messages: [{ role: 'user', content: 'test' }], model: 'command-a-vision-07-2025' },
       headers: {},
       log: vi.fn()
     };

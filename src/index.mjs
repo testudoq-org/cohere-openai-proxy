@@ -69,7 +69,7 @@ class EnhancedCohereRAGServer {
     this.cohere = _defaultCohereClient;
     this.cohereAcceptedAgentOption = _defaultCohereAcceptedAgentOption;
     // Current server-wide default model (mutable via /v1/models/switch)
-    this.currentModel = process.env.COHERE_MODEL || 'command-a-03-2025';
+    this.currentModel = process.env.COHERE_MODEL || 'command-a-vision-07-2025';
 
     this.ragManager = new RAGDocumentManager(this.cohere, { logger });
     this.conversationManager = new ConversationManager(this.ragManager, { logger });
@@ -90,6 +90,14 @@ class EnhancedCohereRAGServer {
     this.setupRoutes();
     this.setupErrorHandling();
 
+    // Non-blocking attach of rate monitoring data if provided by cohereClientFactory
+    (async () => {
+      try {
+        const mod = await import('./utils/cohereClientFactory.mjs');
+        if (mod && mod.recentCalls) this._cohereRecentCalls = mod.recentCalls;
+      } catch (e) { /* ignore */ }
+    })();
+
     this.metrics = {
       httpRequests: new promClient.Counter({ name: 'http_requests_total', help: 'Total HTTP requests' }),
     };
@@ -104,12 +112,12 @@ class EnhancedCohereRAGServer {
 
   async initializeSupportedModels() {
     // Prefer env var, fallback to recommended default
-    const COHERE_MODEL = process.env.COHERE_MODEL || 'command-a-03-2025';
+    const COHERE_MODEL = process.env.COHERE_MODEL || 'command-a-vision-07-2025';
 
     // Curated list of recommended models
     const recommendedModels = [
       COHERE_MODEL,
-      'command-a-03-2025',
+      'command-a-vision-07-2025',
       'command-a-reasoning-08-2025',
       'command-a-vision-07-2025',
       'command-r7b-12-2024'
@@ -118,7 +126,7 @@ class EnhancedCohereRAGServer {
     // Legacy/deprecated aliases (kept for backwards compatibility only)
     // These are not advertised as primary supported options.
     const legacyAliases = [
-      'command-a-03-2025',
+      'command-a-vision-07-2025',
       'command-r',
       'command',
       'command-light'
@@ -408,7 +416,7 @@ class EnhancedCohereRAGServer {
     const startTime = nowMs();
     const traceId = req.headers['x-trace-id'] || generateTraceId();
     try {
-      const { messages, temperature = 0.7, max_tokens, model = process.env.COHERE_MODEL || 'command-a-03-2025', sessionId } = req.body;
+      const { messages, temperature = 0.7, max_tokens, model = process.env.COHERE_MODEL || 'command-a-vision-07-2025', sessionId } = req.body;
       if (!Array.isArray(messages) || messages.length === 0) return res.status(400).json({ error: { message: 'Messages array required', type: 'invalid_request_error' } });
       // PATCH: Validate model and return 400 if invalid (matches test expectations)
       try {

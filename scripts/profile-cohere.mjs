@@ -22,7 +22,7 @@ if (!token) {
   try {
     const { client } = await createCohereClient({ token });
     const payload = {
-      model: process.env.COHERE_MODEL || 'command-a-03-2025',
+      model: process.env.COHERE_MODEL || 'command-a-vision-07-2025',
       message: 'Profile run: please reply briefly.',
       max_tokens: 16,
       temperature: 0.0,

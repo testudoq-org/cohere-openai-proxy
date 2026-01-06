@@ -1,0 +1,8 @@
+POST http://localhost:3000/chat/completions with model=command-a-vision-07-2025
+*   Trying 127.0.0.1:3000...
+* connect to 127.0.0.1 port 3000 failed: Connection refused
+*   Trying ::1:3000...
+* connect to ::1 port 3000 failed: Connection refused
+* Failed to connect to localhost port 3000 after 8 ms: Connection refused
+* Closing connection 0
+curl: (7) Failed to connect to localhost port 3000 after 8 ms: Connection refused
