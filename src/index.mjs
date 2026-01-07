@@ -500,6 +500,17 @@ class EnhancedCohereRAGServer {
       const convoStart = nowMs();
       const conversationData = this.conversationManager.getFormattedHistoryWithRAG(effectiveSessionId);
       if (!DIAGNOSTICS_DISABLED) diagLog({ traceId, phase: 'server:conversation-built', durationMs: nowMs() - convoStart, ragCount: (this.conversationManager.conversations.get(effectiveSessionId)?.ragContext || []).length });
+
+      // SANITIZE: Remove RAG-injected tool-like examples for models that do NOT support tool calling.
+      try {
+        const { sanitizePreambleForModel } = await import('./utils/preambleSanitizer.mjs');
+        const allowToolSyntax = supportsTools(model);
+        const { sanitized, changed } = sanitizePreambleForModel(conversationData.preamble, allowToolSyntax);
+        if (changed) {
+          logger.info({ model, reason: 'sanitized_rag_preamble', truncated: sanitized.slice(0,200) }, 'Sanitized RAG preamble to remove tool-like examples for non-tool model');
+          conversationData.preamble = sanitized;
+        }
+      } catch (e) { logger.warn({ err: e?.message }, 'Failed to sanitize RAG preamble'); }
  
       const streamingEnabled = !!(
         process.env.COHERE_V2_STREAMING_SUPPORTED &&
