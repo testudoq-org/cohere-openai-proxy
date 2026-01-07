@@ -32,6 +32,7 @@ import promClient from 'prom-client';
 import { createStartupWatchdog } from './utils/startupWatchdog.mjs';
 import { httpAgent, httpsAgent, applyGlobalAgents, EXTERNAL_API_TIMEOUT_MS } from './utils/httpAgent.mjs';
 import { createCohereClient, getModelsList, validateModelOrThrow } from './utils/cohereClientFactory.mjs';
+import { supportsTools } from './utils/cohereModelCapabilities.mjs';
 
 import LruTtlCache from './utils/lruTtlCache.mjs';
 import RAGDocumentManager from './ragDocumentManager.mjs';
@@ -453,8 +454,25 @@ class EnhancedCohereRAGServer {
       let sessionId = body.sessionId;
       
       // Extract tool-related parameters from OpenAI request
-      const tools = body.tools; // Array of tool definitions
-      const tool_choice = body.tool_choice; // 'auto', 'none', 'required', or { type: 'function', function: { name } }
+      let tools = body.tools; // Array of tool definitions
+      let tool_choice = body.tool_choice; // 'auto', 'none', 'required', or { type: 'function', function: { name } }
+
+      // Auto-detect whether the selected Cohere model supports tools and
+      // strip tools early in the request pipeline if not supported.
+      try {
+        const modelSupportsToolsEarly = supportsTools(model);
+        if (tools && Array.isArray(tools) && tools.length > 0 && !modelSupportsToolsEarly) {
+          logger.info({ requestedModel: model, toolCount: tools.length, reason: 'model_does_not_support_tools' }, 'Automatically stripping tools - model does not support tool calling');
+          // Strip tool-related fields from the incoming request
+          delete body.tools;
+          delete body.tool_choice;
+          delete body.parallel_tool_calls;
+          tools = null;
+          tool_choice = null;
+        }
+      } catch (e) {
+        logger.error({ err: e?.message }, 'Error while detecting model tool capability - defaulting to leaving tools intact');
+      }
 
       // Map common OpenAI-style model names to the default Cohere model to maintain compatibility
       const openaiToCohereDefaultMap = new Set(['gpt-4o', 'gpt-4o-mini', 'gpt-4o-realtime-preview']);
@@ -671,19 +689,10 @@ class EnhancedCohereRAGServer {
     });
   }
 
-  // Models that support tool calling in Cohere
-  static TOOL_CAPABLE_MODELS = new Set([
-    'command-r-08-2024',
-    'command-r-plus-08-2024',
-    'command-a-03-2025',
-    'command-nightly',
-    'command-r',
-    'command-r-plus'
-  ]);
-
   // Get a tool-capable model, preferring the requested model if it supports tools
+  // Uses centralized capability detection from cohereModelCapabilities.mjs
   getToolCapableModel(requestedModel) {
-    if (EnhancedCohereRAGServer.TOOL_CAPABLE_MODELS.has(requestedModel)) {
+    if (supportsTools(requestedModel)) {
       return requestedModel;
     }
     // Default to command-r-08-2024 for tool calling
@@ -695,8 +704,8 @@ class EnhancedCohereRAGServer {
     const toolsProvided = options.tools && Array.isArray(options.tools) && options.tools.length > 0;
     
     // Only use tools if the requested model supports them
-    // If the client explicitly chose a non-tool model, respect that choice and skip tools
-    const modelSupportsTools = EnhancedCohereRAGServer.TOOL_CAPABLE_MODELS.has(model);
+    // Uses centralized capability detection from cohereModelCapabilities.mjs
+    const modelSupportsTools = supportsTools(model);
     const shouldUseTools = toolsProvided && modelSupportsTools;
     
     if (toolsProvided && !modelSupportsTools) {
