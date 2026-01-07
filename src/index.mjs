@@ -69,7 +69,7 @@ class EnhancedCohereRAGServer {
     this.cohere = _defaultCohereClient;
     this.cohereAcceptedAgentOption = _defaultCohereAcceptedAgentOption;
     // Current server-wide default model (mutable via /v1/models/switch)
-    this.currentModel = process.env.COHERE_MODEL || 'command-a-vision-07-2025';
+    this.currentModel = process.env.COHERE_MODEL || 'command-r-08-2024';
 
     this.ragManager = new RAGDocumentManager(this.cohere, { logger });
     this.conversationManager = new ConversationManager(this.ragManager, { logger });
@@ -112,14 +112,14 @@ class EnhancedCohereRAGServer {
 
   async initializeSupportedModels() {
     // Prefer env var, fallback to recommended default
-    const COHERE_MODEL = process.env.COHERE_MODEL || 'command-a-vision-07-2025';
+    const COHERE_MODEL = process.env.COHERE_MODEL || 'command-r-08-2024';
 
-    // Curated list of recommended models
+    // Curated list of recommended models (tool-capable models preferred)
     const recommendedModels = [
       COHERE_MODEL,
-      'command-a-vision-07-2025',
-      'command-a-reasoning-08-2025',
-      'command-a-vision-07-2025',
+      'command-r-08-2024',
+      'command-r-plus-08-2024',
+      'command-a-03-2025',
       'command-r7b-12-2024'
     ];
 
@@ -449,13 +449,17 @@ class EnhancedCohereRAGServer {
       let messages = body.messages;
       let temperature = typeof body.temperature === 'number' ? body.temperature : 0.7;
       let max_tokens = body.max_tokens;
-      let model = typeof body.model === 'string' ? body.model : process.env.COHERE_MODEL || 'command-a-vision-07-2025';
+      let model = typeof body.model === 'string' ? body.model : process.env.COHERE_MODEL || 'command-r-08-2024';
       let sessionId = body.sessionId;
+      
+      // Extract tool-related parameters from OpenAI request
+      const tools = body.tools; // Array of tool definitions
+      const tool_choice = body.tool_choice; // 'auto', 'none', 'required', or { type: 'function', function: { name } }
 
       // Map common OpenAI-style model names to the default Cohere model to maintain compatibility
       const openaiToCohereDefaultMap = new Set(['gpt-4o', 'gpt-4o-mini', 'gpt-4o-realtime-preview']);
       if (typeof model === 'string' && openaiToCohereDefaultMap.has(model)) {
-        model = process.env.COHERE_MODEL || 'command-a-vision-07-2025';
+        model = process.env.COHERE_MODEL || 'command-r-08-2024';
       }
 
       if (!Array.isArray(messages) || messages.length === 0) return res.status(400).json({ error: { message: 'Messages array required', type: 'invalid_request_error' } });
@@ -485,8 +489,12 @@ class EnhancedCohereRAGServer {
       );
  
       // Call the Cohere API (the client factory will inject stream: true into the payload when supported)
-      const response = await this.callCohereChatAPI(model, conversationData, temperature, max_tokens, traceId);
-      if (!response) return res.status(500).json({ error: { message: 'Failed to receive response from Cohere API', type: 'internal_server_error' } });
+      // Pass tools and tool_choice if provided
+      const apiResult = await this.callCohereChatAPI(model, conversationData, temperature, max_tokens, traceId, { tools, tool_choice });
+      if (!apiResult || !apiResult.response) return res.status(500).json({ error: { message: 'Failed to receive response from Cohere API', type: 'internal_server_error' } });
+      
+      const response = apiResult.response;
+      const actualModel = apiResult.effectiveModel;
  
       // If streaming is enabled, attempt to stream back chunks via Server-Sent Events (SSE).
       if (streamingEnabled) {
@@ -562,11 +570,21 @@ class EnhancedCohereRAGServer {
       const assistantResponse = this.extractResponseText(response) || '';
       this.conversationManager.addMessage(effectiveSessionId, 'assistant', assistantResponse);
 
-      const completionResponse = this.formatChatResponse(response, model, conversationData, startTime, effectiveSessionId);
+      const completionResponse = this.formatChatResponse(response, actualModel, conversationData, startTime, effectiveSessionId);
       res.json(completionResponse);
     } catch (err) {
-      logger.error({ err }, 'Chat completion failed');
-      res.status(500).json({ error: { message: 'Internal server error', type: 'internal_server_error' } });
+      logger.error({ err: err?.message, statusCode: err?.statusCode, body: err?.body }, 'Chat completion failed');
+      
+      // Return appropriate error based on the type
+      const statusCode = err?.statusCode || 500;
+      const errorMessage = err?.body?.message || err?.message || 'Internal server error';
+      
+      res.status(statusCode >= 400 && statusCode < 600 ? statusCode : 500).json({ 
+        error: { 
+          message: errorMessage, 
+          type: statusCode === 400 ? 'invalid_request_error' : 'internal_server_error' 
+        } 
+      });
     }
   }
 
@@ -596,60 +614,269 @@ class EnhancedCohereRAGServer {
     return '';
   }
 
-  async callCohereChatAPI(model, conversationData, temperature, maxTokens) {
+  // Convert OpenAI tool_choice to Cohere format
+  convertToolChoice(toolChoice) {
+    if (!toolChoice) return undefined;
+    if (toolChoice === 'auto') return undefined; // Cohere default behavior
+    if (toolChoice === 'none') return 'NONE';
+    if (toolChoice === 'required') return 'REQUIRED';
+    // OpenAI also supports { type: 'function', function: { name: 'specific_function' } }
+    // Cohere doesn't have direct equivalent for specific function, use REQUIRED
+    if (typeof toolChoice === 'object' && toolChoice.type === 'function') {
+      return 'REQUIRED';
+    }
+    return undefined;
+  }
+
+  // Convert OpenAI tool format to Cohere tool format
+  convertToolsToCohere(openaiTools) {
+    if (!openaiTools || !Array.isArray(openaiTools)) return [];
+    
+    return openaiTools.map(tool => {
+      // OpenAI format: { type: "function", function: { name, description, parameters } }
+      // Cohere format: { name, description, parameter_definitions }
+      const fn = tool.function || tool;
+      const name = fn.name;
+      const description = fn.description || '';
+      
+      // Convert OpenAI JSON Schema parameters to Cohere parameter_definitions
+      // OpenAI: { type: "object", properties: { location: { type: "string", description: "..." } }, required: [...] }
+      // Cohere: { location: { type: "str", description: "...", required: true } }
+      const parameterDefinitions = {};
+      const params = fn.parameters || {};
+      const properties = params.properties || {};
+      const required = params.required || [];
+      
+      for (const [paramName, paramDef] of Object.entries(properties)) {
+        // Map OpenAI types to Cohere types
+        let cohereType = 'str'; // default
+        if (paramDef.type === 'string') cohereType = 'str';
+        else if (paramDef.type === 'number' || paramDef.type === 'integer') cohereType = 'float';
+        else if (paramDef.type === 'boolean') cohereType = 'bool';
+        else if (paramDef.type === 'array') cohereType = 'list';
+        else if (paramDef.type === 'object') cohereType = 'dict';
+        
+        parameterDefinitions[paramName] = {
+          type: cohereType,
+          description: paramDef.description || '',
+          required: required.includes(paramName)
+        };
+      }
+      
+      return {
+        name,
+        description,
+        parameter_definitions: parameterDefinitions
+      };
+    });
+  }
+
+  // Models that support tool calling in Cohere
+  static TOOL_CAPABLE_MODELS = new Set([
+    'command-r-08-2024',
+    'command-r-plus-08-2024',
+    'command-a-03-2025',
+    'command-nightly',
+    'command-r',
+    'command-r-plus'
+  ]);
+
+  // Get a tool-capable model, preferring the requested model if it supports tools
+  getToolCapableModel(requestedModel) {
+    if (EnhancedCohereRAGServer.TOOL_CAPABLE_MODELS.has(requestedModel)) {
+      return requestedModel;
+    }
+    // Default to command-r-08-2024 for tool calling
+    return 'command-r-08-2024';
+  }
+
+  async callCohereChatAPI(model, conversationData, temperature, maxTokens, traceId, options = {}) {
+    // Check if tools were provided in the request
+    const toolsProvided = options.tools && Array.isArray(options.tools) && options.tools.length > 0;
+    
+    // Only use tools if the requested model supports them
+    // If the client explicitly chose a non-tool model, respect that choice and skip tools
+    const modelSupportsTools = EnhancedCohereRAGServer.TOOL_CAPABLE_MODELS.has(model);
+    const shouldUseTools = toolsProvided && modelSupportsTools;
+    
+    if (toolsProvided && !modelSupportsTools) {
+      logger.info({ 
+        requestedModel: model, 
+        toolCount: options.tools.length,
+        reason: 'model_does_not_support_tools' 
+      }, 'Skipping tools - requested model does not support tool calling');
+    }
+
     const payload = { model, message: conversationData.message, temperature: temperature || 0.7, max_tokens: maxTokens || 512 };
     if (conversationData.chatHistory && conversationData.chatHistory.length > 0) payload.chat_history = conversationData.chatHistory;
     if (conversationData.preamble) payload.preamble = conversationData.preamble;
 
-    logger.info({ model, payloadKeys: Object.keys(payload), messageLength: conversationData.message?.length }, 'Preparing Cohere API call');
+    // Add tools only if the model supports them
+    if (shouldUseTools) {
+      payload.tools = this.convertToolsToCohere(options.tools);
+      logger.info({ toolCount: payload.tools.length, toolNames: payload.tools.map(t => t.name) }, 'Tools passed to Cohere API');
+    }
+
+    // Only add tool_choice if we're actually using tools
+    const cohereToolChoice = shouldUseTools ? this.convertToolChoice(options.tool_choice) : null;
+    if (cohereToolChoice) {
+      payload.tool_choice = cohereToolChoice;
+      logger.info({ originalToolChoice: options.tool_choice, cohereToolChoice }, 'Tool choice converted');
+    }
+
+    logger.info({ model, payloadKeys: Object.keys(payload), messageLength: conversationData.message?.length, hasTools: !!payload.tools }, 'Preparing Cohere API call');
 
     try {
       const sent = nowMs();
       if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:call:start', model, payloadSizeChars: String(JSON.stringify(payload).length), start: sent });
 
       // If Cohere client accepts agent, try to use it (best-effort). Otherwise rely on globalAgent.
-      let callFn = () => this.cohere.chat(payload);
-      if (this.cohere && typeof this.cohere.chat === 'function') {
-        // prefer existing SDK behavior; many SDKs accept an options object but not all — keep best-effort
-        callFn = () => this.cohere.chat(payload);
-      } else {
+      if (!this.cohere || typeof this.cohere.chat !== 'function') {
         logger.error({ cohereClient: !!this.cohere, hasChatMethod: typeof this.cohere?.chat === 'function' }, 'Cohere client not properly initialized');
         return null;
       }
 
-      const resp = await callFn();
-      logger.info({ model, responseReceived: !!resp, responseKeys: resp ? Object.keys(resp) : null }, 'Cohere API call successful');
+      const resp = await this.cohere.chat(payload);
+      
+      // Debug: log full response structure when tools are involved
+      if (shouldUseTools) {
+        logger.info({ 
+          fullResponse: JSON.stringify(resp, null, 2).substring(0, 2000),
+          messageKeys: resp?.message ? Object.keys(resp.message) : null,
+          toolCallsRaw: resp?.message?.tool_calls || resp?.tool_calls,
+          toolPlanRaw: resp?.message?.tool_plan || resp?.tool_plan
+        }, 'Full Cohere response with tools');
+      }
+      
+      logger.info({ 
+        model, 
+        responseReceived: !!resp, 
+        responseKeys: resp ? Object.keys(resp) : null,
+        hasToolCalls: !!(resp?.message?.tool_calls || resp?.tool_calls),
+        finishReason: resp?.finish_reason
+      }, 'Cohere API call successful');
       if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:call:end', model, durationMs: nowMs() - sent });
-      return resp;
+      // Return both the response and the model used
+      return { response: resp, effectiveModel: model };
     } catch (err) {
       logger.error({
         err: err?.message,
         model,
         statusCode: err?.status || err?.statusCode,
-        response: err?.response?.data || err?.body,
+        body: err?.body,
         stack: err?.stack
       }, 'Cohere chat API error details');
       if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:error', model, err: String(err?.message), statusCode: err?.status || err?.statusCode });
+      // Re-throw specific errors that should be handled by the caller
+      throw err;
+    }
+  }
+
+  // Extract tool_calls from Cohere response and convert to OpenAI format
+  extractToolCalls(response) {
+    // Cohere V1 API returns toolCalls (camelCase) at root level
+    // Cohere V2 API returns tool_calls (snake_case) at message.tool_calls or root
+    const toolCalls = response?.toolCalls || response?.tool_calls || response?.message?.tool_calls || response?.message?.toolCalls;
+    
+    if (!toolCalls || !Array.isArray(toolCalls) || toolCalls.length === 0) {
       return null;
+    }
+
+    // Convert Cohere tool_calls to OpenAI format
+    // Cohere V1 format: { name, parameters } 
+    // OpenAI format: { id, type: 'function', function: { name, arguments } }
+    return toolCalls.map((tc) => {
+      // Handle Cohere SDK objects that may have accessor methods
+      const id = tc.id || `call_${this.generateId()}`;
+      // V1 uses 'name' directly, V2 uses 'function.name'
+      const functionName = tc.name || tc.function?.name;
+      // V1 uses 'parameters', V2 uses 'function.arguments' or 'arguments'
+      let functionArgs = tc.parameters || tc.function?.arguments || tc.arguments || '{}';
+      
+      // Ensure arguments is a string (JSON)
+      if (typeof functionArgs !== 'string') {
+        try {
+          functionArgs = JSON.stringify(functionArgs);
+        } catch (e) {
+          functionArgs = '{}';
+        }
+      }
+
+      return {
+        id: id,
+        type: 'function',
+        function: {
+          name: functionName,
+          arguments: functionArgs
+        }
+      };
+    });
+  }
+
+  // Map Cohere finish_reason to OpenAI format
+  mapFinishReason(cohereFinishReason, hasToolCalls) {
+    if (!cohereFinishReason) return hasToolCalls ? 'tool_calls' : 'stop';
+    const reason = String(cohereFinishReason).toUpperCase();
+    switch (reason) {
+      case 'COMPLETE': return hasToolCalls ? 'tool_calls' : 'stop';
+      case 'STOP_SEQUENCE': return 'stop';
+      case 'MAX_TOKENS': return 'length';
+      case 'TOOL_CALL': return 'tool_calls';
+      case 'ERROR': return 'stop';
+      default: return hasToolCalls ? 'tool_calls' : 'stop';
     }
   }
 
   formatChatResponse(response, model, conversationData, startTime, sessionId) {
     const generatedText = this.extractResponseText(response) || '';
+    const toolCalls = this.extractToolCalls(response);
+    // Cohere V1 uses camelCase 'finishReason', V2 uses snake_case 'finish_reason'
+    const finishReason = this.mapFinishReason(response?.finishReason || response?.finish_reason, toolCalls && toolCalls.length > 0);
+    
     const processingTime = Date.now() - startTime;
     const promptTokens = this.estimateTokens(conversationData.message) + (conversationData.chatHistory?.length * 10 || 0);
     const completionTokens = this.estimateTokens(generatedText);
+
+    // Build the message object
+    const message = {
+      role: 'assistant',
+      content: generatedText || null
+    };
+
+    // Add tool_calls if present
+    if (toolCalls && toolCalls.length > 0) {
+      message.tool_calls = toolCalls;
+      // When there are tool_calls, content should typically be null
+      if (!generatedText) {
+        message.content = null;
+      }
+      logger.info({ 
+        toolCallCount: toolCalls.length, 
+        toolNames: toolCalls.map(tc => tc.function?.name),
+        finishReason 
+      }, 'Tool calls extracted from Cohere response');
+    }
+
+    // Also extract tool_plan if present (Cohere-specific, useful for debugging)
+    const toolPlan = response?.message?.tool_plan || response?.tool_plan;
+
     return {
       id: `chatcmpl-${this.generateId()}`,
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model: `cohere/${model}`,
-      choices: [{ index: 0, message: { role: 'assistant', content: generatedText }, finish_reason: 'stop' }],
+      choices: [{ 
+        index: 0, 
+        message: message, 
+        finish_reason: toolCalls && toolCalls.length > 0 ? 'tool_calls' : finishReason 
+      }],
       usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
       system_fingerprint: `cohere_chat_${model}_${Date.now()}`,
       processing_time_ms: processingTime,
       session_id: sessionId,
       conversation_stats: this.conversationManager.getStats(),
+      // Include Cohere-specific metadata for debugging
+      ...(toolPlan && { _cohere_tool_plan: toolPlan })
     };
   }
 
