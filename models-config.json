@@ -2,6 +2,7 @@
   "models": [
     { "id": "command-a-vision-07-2025", "type": "generation", "languages": ["en"], "ttlMs": 120000 },
     { "id": "command-r-plus-08-2024", "type": "generation", "languages": ["en"], "ttlMs": 120000 },
+    { "id": "command-r-08-2024", "type": "generation", "languages": ["en"], "ttlMs": 120000 },
     { "id": "command-a-reasoning-08-2025", "type": "generation", "languages": ["en"], "ttlMs": 120000 },
     { "id": "command-a-vision-07-2025", "type": "generation", "languages": ["en"], "ttlMs": 120000 },
     { "id": "command-r7b-12-2024", "type": "generation", "languages": ["en"], "ttlMs": 120000 },

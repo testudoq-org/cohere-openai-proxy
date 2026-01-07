@@ -449,7 +449,7 @@ class EnhancedCohereRAGServer {
       let messages = body.messages;
       let temperature = typeof body.temperature === 'number' ? body.temperature : 0.7;
       let max_tokens = body.max_tokens;
-      let model = typeof body.model === 'string' ? body.model : process.env.COHERE_MODEL || 'command-r-08-2024';
+      let model = typeof body.model === 'string' ? body.model : process.env.COHERE_MODEL || 'command-a-vision-07-2025';
       let sessionId = body.sessionId;
       
       // Extract tool-related parameters from OpenAI request
@@ -459,7 +459,7 @@ class EnhancedCohereRAGServer {
       // Map common OpenAI-style model names to the default Cohere model to maintain compatibility
       const openaiToCohereDefaultMap = new Set(['gpt-4o', 'gpt-4o-mini', 'gpt-4o-realtime-preview']);
       if (typeof model === 'string' && openaiToCohereDefaultMap.has(model)) {
-        model = process.env.COHERE_MODEL || 'command-r-08-2024';
+        model = process.env.COHERE_MODEL || 'command-a-vision-07-2025';
       }
 
       if (!Array.isArray(messages) || messages.length === 0) return res.status(400).json({ error: { message: 'Messages array required', type: 'invalid_request_error' } });
