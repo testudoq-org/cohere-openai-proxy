@@ -198,16 +198,29 @@ class EnhancedCohereRAGServer {
       }
     });
 
-    // Models management endpoints
-    this.app.get('/v1/models', (req, res) => {
+    // Models management endpoints - handler function for reuse
+    const handleModelsList = (req, res) => {
       try {
         const models = getModelsList();
-        res.json({ models });
+        // Return in OpenAI-compatible format
+        const openaiFormat = {
+          object: 'list',
+          data: models.map(m => ({
+            id: typeof m === 'string' ? m : m.id,
+            object: 'model',
+            created: Math.floor(Date.now() / 1000),
+            owned_by: 'cohere'
+          }))
+        };
+        res.json(openaiFormat);
       } catch (e) {
         logger.error({ err: e }, 'Failed to load models list');
         res.status(500).json({ error: { message: 'Failed to load models', type: 'internal_server_error' } });
       }
-    });
+    };
+    this.app.get('/v1/models', handleModelsList);
+    // Alias for OpenAI compatibility (RooCode may call /models directly)
+    this.app.get('/models', handleModelsList);
 
     this.app.post('/v1/models/switch', (req, res) => {
       const { model } = req.body || {};
@@ -321,6 +334,8 @@ class EnhancedCohereRAGServer {
 
     // existing chat + rag + conversation routes
     this.app.post('/v1/chat/completions', this.handleChatCompletion.bind(this));
+    // Compatibility alias: accept OpenAI-style root path for chat completions
+    this.app.post('/chat/completions', this.handleChatCompletion.bind(this));
     this.setupRAGRoutes();
     this.setupConversationRoutes();
 
@@ -416,7 +431,33 @@ class EnhancedCohereRAGServer {
     const startTime = nowMs();
     const traceId = req.headers['x-trace-id'] || generateTraceId();
     try {
-      const { messages, temperature = 0.7, max_tokens, model = process.env.COHERE_MODEL || 'command-a-vision-07-2025', sessionId } = req.body;
+      // Accept OpenAI-style model names by mapping them to known Cohere models.
+      // Extract and normalize request body
+      const body = req.body || {};
+      
+      // Debug logging to diagnose request body issues
+      logger.info({ 
+        traceId,
+        bodyType: typeof body,
+        bodyKeys: body ? Object.keys(body) : null,
+        hasMessages: !!body.messages,
+        messagesType: Array.isArray(body.messages) ? 'array' : typeof body.messages,
+        messagesLength: Array.isArray(body.messages) ? body.messages.length : null,
+        contentType: req.headers['content-type']
+      }, 'Chat completion request body debug');
+      
+      let messages = body.messages;
+      let temperature = typeof body.temperature === 'number' ? body.temperature : 0.7;
+      let max_tokens = body.max_tokens;
+      let model = typeof body.model === 'string' ? body.model : process.env.COHERE_MODEL || 'command-a-vision-07-2025';
+      let sessionId = body.sessionId;
+
+      // Map common OpenAI-style model names to the default Cohere model to maintain compatibility
+      const openaiToCohereDefaultMap = new Set(['gpt-4o', 'gpt-4o-mini', 'gpt-4o-realtime-preview']);
+      if (typeof model === 'string' && openaiToCohereDefaultMap.has(model)) {
+        model = process.env.COHERE_MODEL || 'command-a-vision-07-2025';
+      }
+
       if (!Array.isArray(messages) || messages.length === 0) return res.status(400).json({ error: { message: 'Messages array required', type: 'invalid_request_error' } });
       // PATCH: Validate model and return 400 if invalid (matches test expectations)
       try {
