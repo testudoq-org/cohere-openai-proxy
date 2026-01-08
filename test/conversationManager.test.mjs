@@ -17,9 +17,9 @@ describe('ConversationManager', () => {
   it('handles multilingual content in messages', async () => {
     const session = 'multilingual-session';
     const multilingualContent = {
-      text: 'Hello こんにちは Hola',
+      text: 'Sample multilingual text こんにちは Hola',
       language: 'mixed'
-    };
+    }; 
     await cm.addMessage(session, 'user', multilingualContent);
     const messages = cm.getConversation(session);
     expect(messages).toHaveLength(1);

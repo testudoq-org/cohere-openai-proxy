@@ -1,0 +1,24 @@
+D:\Code\Temp\cohere-openai-proxy\node_modules\cohere-ai\Client.js:260
+                        throw new Cohere.UnprocessableEntityError(_response.error.body);
+                              ^
+
+UnprocessableEntityError: UnprocessableEntityError
+Status code: 422
+Body: {
+  "error_type": "HALLUCINATED_ALL_TOOL_CALLS",
+  "id": "a18d134e-dcb1-4860-92e8-92c65ea9efdc",
+  "message": "all generated tool calls were hallucinated. Try updating tool definitions or use `strict_tools` if it is compatible with this model"
+}
+    at CustomClient.<anonymous> (D:\Code\Temp\cohere-openai-proxy\node_modules\cohere-ai\Client.js:260:31)
+    at Generator.next (<anonymous>)
+    at fulfilled (D:\Code\Temp\cohere-openai-proxy\node_modules\cohere-ai\Client.js:31:58)
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5) {
+  statusCode: 422,
+  body: {
+    error_type: 'HALLUCINATED_ALL_TOOL_CALLS',
+    id: 'a18d134e-dcb1-4860-92e8-92c65ea9efdc',
+    message: 'all generated tool calls were hallucinated. Try updating tool definitions or use `strict_tools` if it is compatible with this model'
+  }
+}
+
+Node.js v22.16.0

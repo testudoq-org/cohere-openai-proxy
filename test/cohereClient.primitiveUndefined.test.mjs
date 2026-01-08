@@ -28,7 +28,7 @@ describe('Cohere client factory - return undefined for missing props', () => {
     expect(client.version).toBe('v9.9.9');
 
     // chat still works
-    const res = await client.chat({ model: 'command-a-03-2025', message: 'hi' });
+    const res = await client.chat({ model: 'command-a-vision-07-2025', message: 'hi' });
     expect(res).toEqual({ text: 'ok' });
     expect(rawClient.chat).toHaveBeenCalled();
   });

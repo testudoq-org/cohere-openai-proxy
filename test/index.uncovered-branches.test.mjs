@@ -20,7 +20,7 @@ describe('Index uncovered branches', () => {
       chat: async () => ({ text: 'ok' }),
       embed: async () => ({ body: { embeddings: [[0.1]] } }),
       rerank: async () => ({ results: [] }),
-      models: { list: async () => ({ models: [{ name: 'command-a-03-2025' }] }) }
+      models: { list: async () => ({ models: [{ name: 'command-a-vision-07-2025' }] }) }
     }));
     mockCohereModule(MockCtor);
 
@@ -31,7 +31,7 @@ describe('Index uncovered branches', () => {
     srv.ragManager = { getStats: () => ({ metrics: {} }), indexCodebase: async () => ({ success: true }), clearIndex: () => {}, shutdown: async () => {} };
     srv.conversationManager = srv.conversationManager || { addMessage: vi.fn(), getFormattedHistoryWithRAG: vi.fn().mockReturnValue({ message: 'hi', chatHistory: [] }), getStats: vi.fn().mockReturnValue({}) };
     // ensure model validation passes
-    srv.supportedModels = new Set(['command-a-03-2025']);
+    srv.supportedModels = new Set(['command-a-vision-07-2025']);
 
     // Express stores middleware layers on app._router.stack
     // Use a direct error handler function matching setupErrorHandling
@@ -69,7 +69,7 @@ describe('Index uncovered branches', () => {
       chat: async () => ({ text: 'ok' }),
       embed: async () => ({ body: { embeddings: [[0.1]] } }),
       rerank: async () => ({ results: [] }),
-      models: { list: async () => ({ models: [{ name: 'command-a-03-2025' }] }) }
+      models: { list: async () => ({ models: [{ name: 'command-a-vision-07-2025' }] }) }
     }));
     mockCohereModule(MockCtor);
 
@@ -93,7 +93,7 @@ describe('Index uncovered branches', () => {
       conversations: new Map()
     };
     // ensure model validation passes
-    srv.supportedModels = new Set(['command-a-03-2025']);
+    srv.supportedModels = new Set(['command-a-vision-07-2025']);
 
     // override callCohereChatAPI to return an async iterable that yields then throws
     srv.callCohereChatAPI = async () => {
@@ -105,7 +105,7 @@ describe('Index uncovered branches', () => {
     };
 
     // fake req/res
-    const req = { body: { messages: [{ role: 'user', content: 'hello' }] }, headers: {} };
+    const req = { body: { messages: [{ role: 'user', content: 'sample message' }] }, headers: {} };
     let writes = [];
     const res = {
       setHeader: vi.fn(),
@@ -135,9 +135,9 @@ describe('Index uncovered branches', () => {
       getStats: vi.fn().mockReturnValue({}),
       conversations: new Map()
     };
-    srv.supportedModels = new Set(['command-a-03-2025']);
+    srv.supportedModels = new Set(['command-a-vision-07-2025']);
 
-    const req = { body: { messages: [{ role: 'user', content: 'hello' }] }, headers: {} };
+    const req = { body: { messages: [{ role: 'user', content: 'sample message' }] }, headers: {} };
     let writes = [];
     let endResolve, errorResolve, errorReject;
     const endPromise = new Promise((r) => { endResolve = r; });

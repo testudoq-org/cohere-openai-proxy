@@ -24,7 +24,7 @@ beforeAll(async () => {
       // vision may be absent or implemented; provide a basic implementation
       vision: async (payload) => ({ data: payload.images || [] }),
       models: {
-        list: async () => ({ models: [{ name: 'command-a-03-2025' }, { name: 'embed-english-v3.0' }, { name: 'rerank-multilingual-v3.0' }] })
+        list: async () => ({ models: [{ name: 'command-a-vision-07-2025' }, { name: 'embed-english-v3.0' }, { name: 'rerank-multilingual-v3.0' }] })
       }
     };
   });
@@ -51,9 +51,9 @@ describe('Vision, RAG, Conversation endpoints', () => {
   });
 
   it('models switch endpoint validates model and updates server.currentModel', async () => {
-    const res = await request(app).post('/v1/models/switch').send({ model: 'command-a-03-2025' }).expect(200);
+    const res = await request(app).post('/v1/models/switch').send({ model: 'command-a-vision-07-2025' }).expect(200);
     expect(res.body.success).toBe(true);
-    expect(res.body.model).toBe('command-a-03-2025');
+    expect(res.body.model).toBe('command-a-vision-07-2025');
   });
 
   it('conversation feedback and history endpoints behave as expected (add feedback, retrieve history)', async () => {

@@ -2,7 +2,7 @@
  * Read COHERE_MODEL at runtime so dotenv-loaded values are respected in Docker.
  */
 function getCohereModel() {
-  return process.env.COHERE_MODEL || 'command-a-03-2025';
+  return process.env.COHERE_MODEL || 'command-a-vision-07-2025';
 }
 
 import { CohereClient } from 'cohere-ai';
@@ -13,6 +13,39 @@ import LruTtlCache from './lruTtlCache.mjs';
 import promClient from 'prom-client';
 import fs from 'fs';
 import path from 'path';
+
+// Global rate limiting (unified across all Cohere operations)
+const GLOBAL_RATE_LIMIT_PER_MIN = Number(process.env.GLOBAL_RATE_LIMIT_PER_MIN) || 35; // safe default under trial
+const GLOBAL_RATE_STATE = { tokens: GLOBAL_RATE_LIMIT_PER_MIN, lastRefillMs: Date.now() };
+
+function _consumeGlobalToken() {
+  const cfg = GLOBAL_RATE_LIMIT_PER_MIN;
+  const now = Date.now();
+  const elapsedMs = Math.max(0, now - GLOBAL_RATE_STATE.lastRefillMs);
+  if (elapsedMs > 0) {
+    const refill = (cfg / 60000) * elapsedMs;
+    GLOBAL_RATE_STATE.tokens = Math.min(cfg, GLOBAL_RATE_STATE.tokens + refill);
+    GLOBAL_RATE_STATE.lastRefillMs = now;
+  }
+  if (GLOBAL_RATE_STATE.tokens >= 1) {
+    GLOBAL_RATE_STATE.tokens -= 1;
+    return 0;
+  }
+  const tokensPerMs = cfg / 60000;
+  const waitMs = Math.ceil((1 - GLOBAL_RATE_STATE.tokens) / tokensPerMs);
+  return waitMs;
+}
+
+// Simple in-process rolling-window tracker for monitoring
+const rateLimitHits = new promClient.Counter({ name: 'rate_limit_hits_total', help: 'Total requests delayed due to rate limiting', labelNames: ['operation', 'type'] });
+const actualRpmGauge = new promClient.Gauge({ name: 'cohere_actual_rpm', help: 'Current requests per minute to Cohere API', labelNames: ['window'] });
+const recentCalls = [];
+function trackCall(operation) {
+  const now = Date.now();
+  recentCalls.push({ timestamp: now, operation });
+  while (recentCalls.length > 0 && (now - recentCalls[0].timestamp) > 60000) recentCalls.shift();
+  try { actualRpmGauge.set({ window: '1m' }, recentCalls.length); } catch (e) { }
+}
 
 // Cohere request latency (seconds) and success/failure counters.
 // Labels: operation (e.g., chat), model (when available)
@@ -116,8 +149,9 @@ export async function createCohereClient({ token, agentOptions = defaultHttpsAge
   }
 
   // Circuit breaker config (env-driven with sensible defaults)
-  const cbFailures = Number(process.env.COHERE_CB_FAILURES) || 2;
-  const cbReset = Number(process.env.COHERE_CB_RESET_MS) || 10000;
+  // Increase defaults to tolerate brief trial/key-related hiccups
+  const cbFailures = Number(process.env.COHERE_CB_FAILURES) || 5;
+  const cbReset = Number(process.env.COHERE_CB_RESET_MS) || 30000;
   const circuit = new SimpleCircuitBreaker({ failureThreshold: cbFailures, resetTimeoutMs: cbReset });
 
   // Default retry options sourced from environment (caller may override by passing options obj later if needed)
@@ -196,8 +230,22 @@ export async function createCohereClient({ token, agentOptions = defaultHttpsAge
               }
               const labels = { operation: String(prop), model: modelLabel };
 
+              // Track the call for rolling-window RPM metrics
+              try { trackCall(labels.operation); } catch (e) { /* ignore */ }
+
               const endTimer = cohereRequestDuration.startTimer(labels);
               try {
+                // Enforce global rate limiter (token-bucket). If tokens exhausted, wait.
+                try {
+                  const waitMs = _consumeGlobalToken();
+                  if (waitMs && waitMs > 0) {
+                    try { rateLimitHits.inc({ operation: labels.operation, type: 'global' }); } catch (e) { /* ignore */ }
+                    await new Promise((r) => setTimeout(r, waitMs));
+                  }
+                } catch (e) {
+                  // If limiter fails, proceed without blocking to avoid total outage
+                }
+
                 const res = await circuit.exec(() => retry(() => value.apply(ctx || rawClient, callArgsForAttempt), callOptions));
                 try { cohereRequestSuccess.inc(labels); } catch (e) { /* ignore metric errors */ }
                 return res;
@@ -280,7 +328,7 @@ function loadModelsConfig() {
     // fallback to minimal defaults if file missing
     _modelsConfig = {
       models: [
-        { id: 'command-a-03-2025', type: 'generation', languages: ['en'], ttlMs: 120000 },
+        { id: 'command-a-vision-07-2025', type: 'generation', languages: ['en'], ttlMs: 120000 },
         { id: 'command-r-plus-08-2024', type: 'generation', languages: ['en'], ttlMs: 120000 },
         { id: 'embed-english-v3.0', type: 'embed', languages: ['en'], ttlMs: 600000 },
         { id: 'embed-multilingual-v3.0', type: 'embed', languages: ['en'], ttlMs: 600000 },
@@ -341,13 +389,31 @@ export async function callCohereChatAPI(clientLike, payload, options) {
   const labels = { operation: 'chat', model: modelLabel };
   const endTimer = cohereRequestDuration.startTimer(labels);
   try {
+    // Ensure vision-capable models include explicit input_type when required by Cohere API.
+    if (/command-a-vision-07-2025|command-a-vision/i.test(modelLabel)) {
+      // If payload uses 'message' for chat but Cohere SDK expects 'input' or 'input_type', add a best-effort mapping.
+      if (payload?.message && !payload?.input_type) {
+        payload.input_type = 'text';
+      }
+    }
     const res = await clientLike.chat(payload, options);
     try { cohereRequestSuccess.inc(labels); } catch (e) { /* ignore metric errors */ }
     return res;
   } catch (err) {
+    // Special-case: surface clear deprecation error on status 420 (used by some Cohere infra to indicate deprecated endpoints)
+    const statusCode = err?.status || err?.statusCode || err?.status_code || err?.response?.status;
+    if (statusCode === 420) {
+      try { console.warn('Cohere API returned 420 - deprecated endpoint detected'); } catch (e) { /* ignore */ }
+      const deprec = new Error('Cohere API returned deprecated endpoint response (420). This endpoint appears to be removed; update to the Chat API.');
+      deprec.statusCode = 420;
+      throw deprec;
+    }
     try { cohereRequestFailure.inc(labels); } catch (e) { /* ignore metric errors */ }
     throw err;
   } finally {
     try { endTimer(); } catch (e) { /* ignore metric errors */ }
   }
 }
+
+// Expose runtime telemetry hooks for debugging/monitoring
+export { recentCalls, _consumeGlobalToken };

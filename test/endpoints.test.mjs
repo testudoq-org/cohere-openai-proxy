@@ -46,7 +46,7 @@ describe('HTTP endpoints', () => {
     const res = await request(app)
       .post('/v1/chat/completions')
       .send({
-        messages: [{ role: 'user', content: 'Hello' }],
+        messages: [{ role: 'user', content: 'Sample message' }],
         model: 'command-r-plus-08-2024'
       })
       .expect(200);
@@ -57,7 +57,7 @@ describe('HTTP endpoints', () => {
     const res = await request(app)
       .post('/v1/chat/completions')
       .send({
-        messages: [{ role: 'user', content: 'Hello' }],
+        messages: [{ role: 'user', content: 'Sample message' }],
         model: 'invalid-model-name'
       })
       .expect(400);

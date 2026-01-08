@@ -5,6 +5,7 @@ This document previously described a legacy CommonJS layout. The repository has 
 All application files should reside in `/cop` on the production webhost.
 
 **Directory layout (ESM):**
+
 ```
 /cop/
   src/index.mjs
@@ -22,14 +23,18 @@ All application files should reside in `/cop` on the production webhost.
 
 **For Docker deployments:**
 Do not copy `.env` into the image. Instead, inject environment variables at runtime using:
+
 ```sh
 docker run --env-file .env <image-name>
 ```
+
 This ensures your environment variables are available and avoids issues with `.dockerignore` or missing files at build time.
 
 **Start the application:**
+
 ```sh
 cd /cop
 npm start
 ```
-Set the COHERE_MODEL environment variable (default: command-a-reasoning-08-2025) to control which Cohere model is used.
+
+Set the COHERE_MODEL environment variable (default: command-a-vision-07-2025) to control which Cohere model is used.

@@ -10,7 +10,7 @@ describe('RAGDocumentManager', () => {
   beforeEach(() => { mgr = new RAGDocumentManager(fakeCohere, { logger: console }); mgr.clearIndex(); });
 
   it('caches embeddings', async () => {
-    const text = 'hello world';
+    const text = 'sample text';
     const emb1 = await mgr.getEmbedding(text);
     const emb2 = await mgr.getEmbedding(text);
     expect(emb1).toBeDefined();

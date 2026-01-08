@@ -1,0 +1,21 @@
+*** Begin Patch
+*** Update File: src/utils/cohereClientFactory.mjs
+@@
+-  const labels = { operation: 'chat', model: modelLabel };
+-  const endTimer = cohereRequestDuration.startTimer(labels);
+-  try {
+-    const res = await clientLike.chat(payload, options);
++  const labels = { operation: 'chat', model: modelLabel };
++  const endTimer = cohereRequestDuration.startTimer(labels);
++  try {
++    // Ensure vision-capable models include explicit input_type when required by Cohere API.
++    if (/command-a-vision-07-2025|command-a-vision/i.test(modelLabel)) {
++      // If payload uses 'message' for chat but Cohere SDK expects 'input' or 'input_type', add a best-effort mapping.
++      if (payload?.message && !payload?.input_type) {
++        payload.input_type = 'text';
++      }
++    }
++    const res = await clientLike.chat(payload, options);
+     try { cohereRequestSuccess.inc(labels); } catch (e) { /* ignore metric errors */ }
+     return res;
+*** End Patch

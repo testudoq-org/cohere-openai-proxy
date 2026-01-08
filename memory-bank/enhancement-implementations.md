@@ -78,4 +78,14 @@ Notes
 - Follow-up PRs should be smaller and scoped: (1) schema validation + API auth, (2) circuit breaker + retries, (3) persistent vector DB + Redis.
 
 If you'd like, I can now open follow-up PR drafts for each of the next three prioritized items and prepare checklists and unit tests for them.
+
+### Jan 2026 — Follow-ups / Next steps (short-term priorities)
+
+- **Streaming & SSE hardening (urgent):** Ensure the server writes SSE 'error' events consistently on stream failures and that tests reliably await `end`/`error` events; add unit/integration tests to cover both async-iterables and Node-style streams.
+- **Rate-limit-aware retry/backoff (high priority):** Implement exponential backoff with jitter and honor `Retry-After`/rate-limit headers in the Cohere client wrapper; add unit tests simulating 429 responses and header behavior.
+- **Integration tests for aliases & tools (high priority):** Add end-to-end tests that mix OpenAI alias inputs (e.g., `gpt-4o`, unknown `gpt-*`), RAG preambles with tool-like examples, and explicit `tools` arrays to validate end-to-end behavior.
+- **Configurable sanitization policy (medium):** Offer a configuration toggle or policy file to control sanitization strictness (redaction vs removal) and make it auditable.
+- **Monitoring and alerts (medium):** Add telemetry and alerts for cases where a model requests tools but is non-tool-capable (indicates mis-specified requests) so we can detect client-side issues.
+
+These follow-ups will be prioritized after the current stabilization work and can be split into small, reviewable PRs.
 ```

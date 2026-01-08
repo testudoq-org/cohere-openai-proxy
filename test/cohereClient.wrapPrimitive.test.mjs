@@ -27,7 +27,7 @@ describe('Cohere client factory - primitive property passthrough', () => {
     expect(client.version).toBe('v1.2.3');
 
     // Also ensure function properties are still callable
-    const res = await client.chat({ model: 'command-a-03-2025', message: 'hi' });
+    const res = await client.chat({ model: 'command-a-vision-07-2025', message: 'hi' });
     expect(res).toEqual({ text: 'ok' });
     expect(rawClient.chat).toHaveBeenCalled();
   });

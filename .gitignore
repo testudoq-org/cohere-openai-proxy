@@ -163,3 +163,6 @@ dist/prod/
 .ionide
 
 # End of https://www.toptal.com/developers/gitignore/api/node,visualstudiocode
+
+#Ignore vscode AI rules
+.github\instructions\codacy.instructions.md

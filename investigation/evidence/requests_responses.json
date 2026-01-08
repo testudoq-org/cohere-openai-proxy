@@ -1,0 +1,78 @@
+[
+  {
+    "id": "req-0001",
+    "source": "client->router",
+    "traceId": "mk0od3awpg0cvsr0",
+    "timestamp_log_time": 1767588178426,
+    "router_endpoint": "/v1/chat/completions",
+    "client_payload_raw_snippet": "{messages:[{role:user,content:What is a firewall?}]}",
+    "router_response_status": 400,
+    "router_response_body": {
+      "error": "Invalid request",
+      "details": "Unexpected token at start of body; client likely sent non-JSON (single-quoted or unquoted keys/values)."
+    },
+    "notes": "Malformed JSON body received by router; router returned 400 before contacting Cohere."
+  },
+  {
+    "id": "req-0002",
+    "source": "router->cohere (embed/chat)",
+    "traceId": "mk0ogtlnisuf620a",
+    "timestamp_log_time": 1767588353998,
+    "cohere_model": "command-a-vision-07-2025",
+    "operation": "embedding (semantic search fallback)",
+    "request_summary": {
+      "endpoint": "/v1/embed",
+      "payload_summary": "texts: [<sanitized>], batchSize: 1",
+      "payloadSizeChars": 96
+    },
+    "upstream_response_status": 400,
+    "upstream_response_body": {
+      "id": "ea8cc287-5251-4d18-af2a-8f07d3d89233",
+      "message": "invalid request: valid input_type must be provided with the provided model"
+    },
+    "response_headers": {},
+    "client_library": {
+      "name": "cohere-ai",
+      "version": "7.17.1"
+    },
+    "notes": "Cohere rejected the embedding call for this model: model requires explicit input_type or different payload shape when using vision-capable models."
+  },
+  {
+    "id": "req-0003",
+    "source": "router->cohere",
+    "traceId": "mk0o3uae0u82a5x9",
+    "timestamp_log_time": 1767587750983,
+    "cohere_model": "command-a-vision-07-2025",
+    "operation": "chat",
+    "request_summary": {
+      "endpoint": "SDK->/v2/chat",
+      "payload_summary": "model, message; payloadSizeChars: 96"
+    },
+    "upstream_response_status": 429,
+    "upstream_response_body": {
+      "id": "4bd38cee-2de6-4aa0-af18-9185167f8c56",
+      "message": "Please wait and try again later"
+    },
+    "response_headers": {},
+    "client_library": {
+      "name": "cohere-ai",
+      "version": "7.17.1"
+    },
+    "notes": "Multiple 429s in logs; body includes Trial-key notice: 'limited to 40 API calls / minute'. No x-rate-limit headers captured by current logging."
+  },
+  {
+    "id": "req-0004",
+    "source": "router->cohere",
+    "traceId": "mk0o3uae0u82a5x9",
+    "timestamp_log_time": 1767587761082,
+    "cohere_model": "command-a-vision-07-2025",
+    "operation": "chat",
+    "request_summary": {
+      "endpoint": "/v2/chat",
+      "payload_summary": "model, message; payloadSizeChars: 96"
+    },
+    "upstream_error": "ETIMEDOUT",
+    "error_message": "per-attempt timeout",
+    "notes": "Retry logic experienced per-attempt timeouts while calling Cohere; likely network slowness or upstream throttling resulting in timeouts."
+  }
+]

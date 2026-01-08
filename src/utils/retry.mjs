@@ -64,9 +64,15 @@ export async function retry(fn, options = {}) {
   // default retryOn: retry on network-like errors (no status) or 5xx status codes or when error.code exists
   const defaultRetryOn = (err) => {
     if (!err) return false;
-    // if there's a numeric status, retry on 5xx
-    if (typeof err.status === 'number') return err.status >= 500;
-    if (typeof err.statusCode === 'number') return err.statusCode >= 500;
+    // if there's a numeric status, retry on 5xx or 429
+    if (typeof err.status === 'number') {
+      if (err.status === 429) return true; // treat 429 Too Many Requests as retriable
+      return err.status >= 500;
+    }
+    if (typeof err.statusCode === 'number') {
+      if (err.statusCode === 429) return true;
+      return err.statusCode >= 500;
+    }
     // if there's a code (e.g., ECONNRESET) treat as retryable
     if (err.code) return true;
     // otherwise assume network error -> retry

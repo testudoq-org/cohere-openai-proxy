@@ -71,8 +71,8 @@ describe('LruTtlCache', () => {
     });
 
     it('handles different embedding models separately', () => {
-      const key1 = 'embed:embed-english-v3.0:["hello"]';
-      const key2 = 'embed:embed-multilingual-v3.0:["hello"]';
+      const key1 = 'embed:embed-english-v3.0:["sample"]';
+      const key2 = 'embed:embed-multilingual-v3.0:["sample"]';
 
       cache.set(key1, [[1, 2, 3]]);
       cache.set(key2, [[4, 5, 6]]);
