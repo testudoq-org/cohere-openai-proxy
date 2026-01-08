@@ -25,7 +25,7 @@ describe('Embeddings and Reranking endpoints', () => {
       const res = await request(app)
         .post('/v1/embed')
         .send({
-          input: ['Hello world', 'How are you?'],
+          input: ['Sample text', 'How are you?'],
           model: 'embed-english-v3.0'
         })
         .expect(200);

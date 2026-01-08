@@ -78,7 +78,7 @@ Expected: 200/202 and JSON acknowledging the job (e.g., `{ jobId, status: 'queue
 ```powershell
 $body = @{
   model = 'command-r'
-  messages = @(@{role='user'; content='Hello, please summarize a small repo.'})
+  messages = @(@{role='user'; content='Please summarize a small repo.'})
 } | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri http://localhost:3000/v1/chat/completions -Body $body -ContentType 'application/json'
 ```
@@ -112,4 +112,13 @@ Expected: That single test file runs; useful while developing endpoints or middl
 - Tool calls are only passed if the selected model supports them; otherwise, tools are skipped and a direct text answer is returned.
 - OpenAI model names like `gpt-4o` are mapped to the default Cohere model for compatibility.
 - This prevents tool-calling loops and ensures user-friendly fallback to plain chat when tools are not needed or not supported.
+
+### Jan 2026 — Tool handling & RAG sanitization (implemented)
+
+- Resolved OpenAI-style aliases early in the request flow so capability checks use the resolved Cohere model, preventing accidental tool forwarding.
+- Centralized tool-capability logic in `src/utils/cohereModelCapabilities.mjs` (`supportsTools`, `stripToolsIfUnsupported`) to make tool decisions deterministic and testable.
+- Expanded RAG preamble sanitization (`src/utils/preambleSanitizer.mjs`) to redact common tool-like constructs, self-closing tags, and code-fence examples that could trigger tool-like behavior.
+- Sanitized conversation messages and assistant outputs for non-tool-capable models so the UI does not surface fake tool calls.
+- Added unit and integration tests plus a global Cohere SDK test mock (`test/setup.mjs`) to stabilize tests and eliminate external 429/timeouts.
+- Result: tests pass locally and RAG/tool-related user-facing noise is significantly reduced. Remaining work: implement rate-limit-aware retry/backoff and add broader integration tests for alias → tool behavior.
 - Documentation and config files have been updated to reflect these changes.

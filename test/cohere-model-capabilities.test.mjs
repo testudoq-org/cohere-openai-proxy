@@ -255,10 +255,10 @@ describe('cohereModelCapabilities', () => {
 
     const mockRequestWithTools = {
       model: 'gpt-4',
-      messages: [{ role: 'user', content: 'Hello' }],
+      messages: [{ role: 'user', content: 'Sample message' }],
       tools: mockTools,
       tool_choice: 'auto',
-    };
+    }; 
 
     it('should not modify request for tool-capable model', () => {
       const result = stripToolsIfUnsupported(mockRequestWithTools, 'command-r-08-2024');
@@ -290,8 +290,8 @@ describe('cohereModelCapabilities', () => {
     it('should not modify request without tools', () => {
       const reqNoTools = {
         model: 'gpt-4',
-        messages: [{ role: 'user', content: 'Hello' }],
-      };
+        messages: [{ role: 'user', content: 'Sample message' }],
+      }; 
       const result = stripToolsIfUnsupported(reqNoTools, 'command-a-vision-07-2025');
       
       expect(result).toEqual(reqNoTools);
@@ -300,9 +300,9 @@ describe('cohereModelCapabilities', () => {
     it('should handle empty tools array', () => {
       const reqEmptyTools = {
         model: 'gpt-4',
-        messages: [{ role: 'user', content: 'Hello' }],
+        messages: [{ role: 'user', content: 'Sample message' }],
         tools: [],
-      };
+      }; 
       const result = stripToolsIfUnsupported(reqEmptyTools, 'command-a-vision-07-2025');
       
       expect(result.tools).toEqual([]); // Empty array preserved, not stripped

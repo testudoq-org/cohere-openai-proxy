@@ -330,7 +330,6 @@ function loadModelsConfig() {
       models: [
         { id: 'command-a-vision-07-2025', type: 'generation', languages: ['en'], ttlMs: 120000 },
         { id: 'command-r-plus-08-2024', type: 'generation', languages: ['en'], ttlMs: 120000 },
-        { id: 'command-r-08-2024', type: 'generation', languages: ['en'], ttlMs: 120000 },
         { id: 'embed-english-v3.0', type: 'embed', languages: ['en'], ttlMs: 600000 },
         { id: 'embed-multilingual-v3.0', type: 'embed', languages: ['en'], ttlMs: 600000 },
         { id: 'rerank-multilingual-v3.0', type: 'rerank', languages: ['en'], ttlMs: 600000 },

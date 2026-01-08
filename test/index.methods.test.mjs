@@ -98,4 +98,32 @@ describe('EnhancedCohereRAGServer methods', () => {
     expect(res.write).toHaveBeenCalledWith('event: done\ndata: {}\n\n');
     expect(res.end).toHaveBeenCalled();
   });
+
+  it('sanitizes conversation messages before sending to a non-tool-capable model', async () => {
+    // Capture the conversationData passed to callCohereChatAPI
+    let capturedConversation;
+    server.callCohereChatAPI = vi.fn(async (model, conversationData) => { capturedConversation = conversationData; return { response: { body: { message: { content: 'ok' } } }, effectiveModel: model }; });
+
+    server.cohere = { chat: vi.fn() };
+    server.conversationManager = {
+      addMessage: vi.fn(),
+      getFormattedHistoryWithRAG: vi.fn().mockReturnValue({ message: '<execute_command>echo "Hello"</execute_command>', chatHistory: [] }),
+      getStats: vi.fn().mockReturnValue({}),
+      conversations: new Map()
+    };
+
+    const req = { body: { messages: [{ role: 'user', content: 'dummy' }], model: 'command-a-vision-07-2025' }, headers: {}, log: vi.fn() };
+    const res = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+
+    await server.handleChatCompletion(req, res);
+
+    expect(capturedConversation).toBeDefined();
+    expect(capturedConversation.message).not.toContain('<execute_command');
+  });
+
+  it('redacts tool-like tags from assistant output when model does not support tools', async () => {
+    const response = { message: { content: '<execute_command>echo "Hello"</execute_command>' } };
+    const result = server.formatChatResponse(response, 'command-a-vision-07-2025', { message: 'x', chatHistory: [] }, Date.now(), 's1');
+    expect(result.choices[0].message.content).not.toContain('<execute_command');
+  });
 });

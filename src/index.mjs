@@ -32,7 +32,8 @@ import promClient from 'prom-client';
 import { createStartupWatchdog } from './utils/startupWatchdog.mjs';
 import { httpAgent, httpsAgent, applyGlobalAgents, EXTERNAL_API_TIMEOUT_MS } from './utils/httpAgent.mjs';
 import { createCohereClient, getModelsList, validateModelOrThrow } from './utils/cohereClientFactory.mjs';
-import { supportsTools } from './utils/cohereModelCapabilities.mjs';
+import { supportsTools, stripToolsIfUnsupported } from './utils/cohereModelCapabilities.mjs';
+import { sanitizePreambleForModel } from './utils/preambleSanitizer.mjs';
 
 import LruTtlCache from './utils/lruTtlCache.mjs';
 import RAGDocumentManager from './ragDocumentManager.mjs';
@@ -457,28 +458,25 @@ class EnhancedCohereRAGServer {
       let tools = body.tools; // Array of tool definitions
       let tool_choice = body.tool_choice; // 'auto', 'none', 'required', or { type: 'function', function: { name } }
 
-      // Auto-detect whether the selected Cohere model supports tools and
-      // strip tools early in the request pipeline if not supported.
-      try {
-        const modelSupportsToolsEarly = supportsTools(model);
-        if (tools && Array.isArray(tools) && tools.length > 0 && !modelSupportsToolsEarly) {
-          logger.info({ requestedModel: model, toolCount: tools.length, reason: 'model_does_not_support_tools' }, 'Automatically stripping tools - model does not support tool calling');
-          // Strip tool-related fields from the incoming request
-          delete body.tools;
-          delete body.tool_choice;
-          delete body.parallel_tool_calls;
-          tools = null;
-          tool_choice = null;
-        }
-      } catch (e) {
-        logger.error({ err: e?.message }, 'Error while detecting model tool capability - defaulting to leaving tools intact');
-      }
-
       // Map common OpenAI-style model names to the default Cohere model to maintain compatibility
+      // (do this early so we check capabilities against the resolved Cohere model)
       const openaiToCohereDefaultMap = new Set(['gpt-4o', 'gpt-4o-mini', 'gpt-4o-realtime-preview']);
       if (typeof model === 'string' && openaiToCohereDefaultMap.has(model)) {
         model = process.env.COHERE_MODEL || 'command-a-vision-07-2025';
       }
+
+      // Auto-detect whether the selected Cohere model supports tools and
+      // strip tools early in the request pipeline if not supported.
+      try {
+        const stripped = stripToolsIfUnsupported(body, model, logger);
+        // If stripToolsIfUnsupported modified the body it will have removed tools/tool_choice/parallel_tool_calls
+        tools = stripped.tools || null;
+        tool_choice = stripped.tool_choice || null;
+      } catch (e) {
+        logger.error({ err: e?.message }, 'Error while detecting model tool capability - defaulting to leaving tools intact');
+      }
+
+
 
       if (!Array.isArray(messages) || messages.length === 0) return res.status(400).json({ error: { message: 'Messages array required', type: 'invalid_request_error' } });
       // PATCH: Validate model and return 400 if invalid (matches test expectations)
@@ -501,16 +499,30 @@ class EnhancedCohereRAGServer {
       const conversationData = this.conversationManager.getFormattedHistoryWithRAG(effectiveSessionId);
       if (!DIAGNOSTICS_DISABLED) diagLog({ traceId, phase: 'server:conversation-built', durationMs: nowMs() - convoStart, ragCount: (this.conversationManager.conversations.get(effectiveSessionId)?.ragContext || []).length });
 
-      // SANITIZE: Remove RAG-injected tool-like examples for models that do NOT support tool calling.
+      // SANITIZE: Remove tool-like examples for models that do NOT support tool calling.
       try {
-        const { sanitizePreambleForModel } = await import('./utils/preambleSanitizer.mjs');
         const allowToolSyntax = supportsTools(model);
-        const { sanitized, changed } = sanitizePreambleForModel(conversationData.preamble, allowToolSyntax);
-        if (changed) {
-          logger.info({ model, reason: 'sanitized_rag_preamble', truncated: sanitized.slice(0,200) }, 'Sanitized RAG preamble to remove tool-like examples for non-tool model');
-          conversationData.preamble = sanitized;
+        // Sanitize RAG preamble
+        const { sanitized: sanitizedPreamble, changed: preambleChanged } = sanitizePreambleForModel(conversationData.preamble, allowToolSyntax);
+        if (preambleChanged) {
+          logger.info({ model, reason: 'sanitized_rag_preamble', truncated: sanitizedPreamble.slice(0,200) }, 'Sanitized RAG preamble to remove tool-like examples for non-tool model');
+          conversationData.preamble = sanitizedPreamble;
         }
-      } catch (e) { logger.warn({ err: e?.message }, 'Failed to sanitize RAG preamble'); }
+        // Additionally sanitize the main prompt and chat history so the model doesn't see tool examples in messages.
+        if (!allowToolSyntax) {
+          const { sanitized: sanitizedMessage, changed: msgChanged } = sanitizePreambleForModel(conversationData.message, allowToolSyntax);
+          if (msgChanged) {
+            logger.info({ model, reason: 'sanitized_messages', truncated: sanitizedMessage.slice(0,200) }, 'Sanitized conversation message to remove tool-like examples for non-tool model');
+            conversationData.message = sanitizedMessage;
+          }
+          if (Array.isArray(conversationData.chatHistory)) {
+            conversationData.chatHistory = conversationData.chatHistory.map((h) => {
+              if (typeof h === 'string') return sanitizePreambleForModel(h, allowToolSyntax).sanitized;
+              return h;
+            });
+          }
+        }
+      } catch (e) { logger.warn({ err: e?.message }, 'Failed to sanitize conversation content'); }
  
       const streamingEnabled = !!(
         process.env.COHERE_V2_STREAMING_SUPPORTED &&
@@ -520,10 +532,10 @@ class EnhancedCohereRAGServer {
       // Call the Cohere API (the client factory will inject stream: true into the payload when supported)
       // Pass tools and tool_choice if provided
       const apiResult = await this.callCohereChatAPI(model, conversationData, temperature, max_tokens, traceId, { tools, tool_choice });
-      if (!apiResult || !apiResult.response) return res.status(500).json({ error: { message: 'Failed to receive response from Cohere API', type: 'internal_server_error' } });
-      
-      const response = apiResult.response;
-      const actualModel = apiResult.effectiveModel;
+      // Support both shapes: { response, effectiveModel } or raw response/emitter/async-iterable returned directly from override
+      const response = apiResult && typeof apiResult === 'object' && ('response' in apiResult) ? apiResult.response : apiResult;
+      const actualModel = apiResult && typeof apiResult === 'object' && ('effectiveModel' in apiResult) ? apiResult.effectiveModel : model;
+      if (!response) return res.status(500).json({ error: { message: 'Failed to receive response from Cohere API', type: 'internal_server_error' } });
  
       // If streaming is enabled, attempt to stream back chunks via Server-Sent Events (SSE).
       if (streamingEnabled) {
@@ -787,8 +799,8 @@ class EnhancedCohereRAGServer {
         stack: err?.stack
       }, 'Cohere chat API error details');
       if (!DIAGNOSTICS_DISABLED) diagLog({ phase: 'cohere:error', model, err: String(err?.message), statusCode: err?.status || err?.statusCode });
-      // Re-throw specific errors that should be handled by the caller
-      throw err;
+      // Return null on API errors so callers can handle failures gracefully
+      return null;
     }
   }
 
@@ -848,8 +860,20 @@ class EnhancedCohereRAGServer {
   }
 
   formatChatResponse(response, model, conversationData, startTime, sessionId) {
-    const generatedText = this.extractResponseText(response) || '';
+    let generatedText = this.extractResponseText(response) || '';
     const toolCalls = this.extractToolCalls(response);
+
+    // If model doesn't support tools, redact any tool-like tags from the generated text to avoid showing fake tool calls
+    try {
+      if (!supportsTools(model) && typeof generatedText === 'string') {
+        const { sanitized: sanitizedGen, changed } = sanitizePreambleForModel(generatedText, false);
+        if (changed) {
+          logger.info({ model, reason: 'redacted_tool_like_output' }, 'Redacted tool-like constructs from assistant output for non-tool model');
+          generatedText = sanitizedGen;
+        }
+      }
+    } catch (e) { logger.warn({ err: e?.message }, 'Failed to sanitize assistant output'); }
+
     // Cohere V1 uses camelCase 'finishReason', V2 uses snake_case 'finish_reason'
     const finishReason = this.mapFinishReason(response?.finishReason || response?.finish_reason, toolCalls && toolCalls.length > 0);
     

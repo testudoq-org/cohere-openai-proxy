@@ -105,7 +105,7 @@ describe('Index uncovered branches', () => {
     };
 
     // fake req/res
-    const req = { body: { messages: [{ role: 'user', content: 'hello' }] }, headers: {} };
+    const req = { body: { messages: [{ role: 'user', content: 'sample message' }] }, headers: {} };
     let writes = [];
     const res = {
       setHeader: vi.fn(),
@@ -137,7 +137,7 @@ describe('Index uncovered branches', () => {
     };
     srv.supportedModels = new Set(['command-a-vision-07-2025']);
 
-    const req = { body: { messages: [{ role: 'user', content: 'hello' }] }, headers: {} };
+    const req = { body: { messages: [{ role: 'user', content: 'sample message' }] }, headers: {} };
     let writes = [];
     let endResolve, errorResolve, errorReject;
     const endPromise = new Promise((r) => { endResolve = r; });

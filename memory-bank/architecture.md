@@ -154,3 +154,12 @@ All configuration is via environment variables:
 - This prevents tool-calling loops and ensures a user-friendly fallback to plain chat when tools are not needed or not supported.
 
 ---
+
+### Jan 2026 — Tool capability & sanitization
+
+- **Centralized capability detection:** `src/utils/cohereModelCapabilities.mjs` is the single source of truth for whether a Cohere model supports tool calling. It exposes `supportsTools()` and `stripToolsIfUnsupported()` and supports explicit env overrides (`COHERE_TOOL_CAPABLE_MODELS`, `COHERE_FORCE_STRIP_TOOLS`).
+- **Sanitization pipeline:** `src/utils/preambleSanitizer.mjs` strips tool-like XML tags, self-closing tags, and code-fence-contained examples. The sanitizer is applied to RAG preambles, conversation messages, and assistant outputs when the target model does not support tools.
+- **Chat flow updates:** Alias resolution now occurs early in `handleChatCompletion`, `callCohereChatAPI()` conditionally passes `tools` only when `supportsTools(model)` is true, and the server handles both async-iterable and Node-style stream responses for streaming.
+- **Testing:** Added a global test setup that provides a deterministic mocked Cohere client (`test/setup.mjs`), along with unit and integration tests for tool-stripping and sanitizer behavior.
+
+---
